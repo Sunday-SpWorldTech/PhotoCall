@@ -15,15 +15,11 @@ const Busboy = require('busboy');
 
 const PORT = Number(process.env.PORT || 3000);
 const CLIENT_URL = process.env.CLIENT_URL || 'https://photocall-frontend.vercel.app';
-const PUBLIC_API_URL = String(process.env.PUBLIC_API_URL || '').replace(/\/$/, '');
-const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
-
-function requireJwtSecret() {
-  if (!JWT_SECRET) {
-    throw new Error('JWT_SECRET is not configured on the backend. Add it to the Vercel Production environment variables.');
-  }
-  return JWT_SECRET;
-}
+const JWT_SECRET = () => {
+  const value = String(process.env.JWT_SECRET || '').trim();
+  if (!value) throw new Error('JWT_SECRET is not configured on the server.');
+  return value;
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -101,9 +97,8 @@ async function connectDb() {
 */
 
 app.use(async (req, _res, next) => {
-  // These endpoints are intentionally database-independent so a fresh Vercel
-  // deployment can report configuration/runtime problems instead of failing
-  // during function initialization. All authenticated/data routes still use DB.
+  // Diagnostics and ICE configuration must remain available even when MongoDB
+  // is temporarily unavailable; authenticated/data routes still require DB.
   if (req.path === '/health' || req.path === '/api/config') {
     return next();
   }
@@ -155,6 +150,16 @@ const User = mongoose.model(
       avatarEnabled: {
         type: Boolean,
         default: true
+      },
+
+      avatarImage: {
+        type: Buffer,
+        default: null
+      },
+
+      avatarMime: {
+        type: String,
+        default: 'image/jpeg'
       },
 
       voiceEnabled: {
@@ -250,6 +255,7 @@ function publicUser(user) {
     email: user.email,
     avatarName: user.avatarName || '',
     avatarEnabled: !!user.avatarEnabled,
+    avatarReady: !!user.avatarImage?.length,
     voiceEnabled: !!user.voiceEnabled,
     voiceReady: user.voiceStatus === 'ready'
   };
@@ -262,7 +268,7 @@ function sign(user) {
       email: user.email,
       name: user.name
     },
-    requireJwtSecret(),
+    JWT_SECRET(),
     {
       expiresIn: process.env.JWT_EXPIRES_IN || '7d'
     }
@@ -285,7 +291,7 @@ function auth(req, res, next) {
   try {
     req.user = jwt.verify(
       token,
-      requireJwtSecret()
+      JWT_SECRET()
     );
 
     next();
@@ -306,23 +312,20 @@ app.get(
   '/health',
   (_req, res) => {
     const missing = [];
-    if (!process.env.MONGODB_URI) missing.push('MONGODB_URI');
-    if (!JWT_SECRET) missing.push('JWT_SECRET');
+    for (const key of ['JWT_SECRET', 'MONGODB_URI']) {
+      if (!String(process.env[key] || '').trim()) missing.push(key);
+    }
 
-    const configured = {
-      mongodb: Boolean(process.env.MONGODB_URI),
-      jwt: Boolean(JWT_SECRET),
-      metered: Boolean(process.env.METERED_DOMAIN && process.env.METERED_TURN_API_KEY),
-      elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY)
-    };
-
-    const healthy = missing.length === 0;
-
-    res.status(healthy ? 200 : 503).json({
-      ok: healthy,
+    res.status(missing.length ? 503 : 200).json({
+      ok: missing.length === 0,
       service: 'photocall',
-      database: mongoose.connection.readyState === 1 ? 'connected' : 'not-connected',
-      configured,
+      database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+      configuration: {
+        jwt: missing.includes('JWT_SECRET') ? 'missing' : 'configured',
+        mongodb: missing.includes('MONGODB_URI') ? 'missing' : 'configured',
+        metered: Boolean(process.env.METERED_DOMAIN && process.env.METERED_TURN_API_KEY),
+        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY)
+      },
       missing,
       time: new Date().toISOString()
     });
@@ -410,7 +413,7 @@ app.get(
       if (metered) {
         return res.json({
           appName: 'PhotoCall',
-          apiBaseUrl: PUBLIC_API_URL || CLIENT_URL,
+          apiBaseUrl: CLIENT_URL,
           iceServers: metered,
           turnProvider: 'metered',
           maxPeersPerRoom: 2
@@ -447,7 +450,7 @@ app.get(
 
     res.json({
       appName: 'PhotoCall',
-      apiBaseUrl: PUBLIC_API_URL || CLIENT_URL,
+      apiBaseUrl: CLIENT_URL,
       iceServers,
       turnProvider: 'fallback',
       maxPeersPerRoom: 2
@@ -649,6 +652,80 @@ app.patch(
     });
   }
 );
+
+/*
+|--------------------------------------------------------------------------
+| AVATAR IMAGE UPLOAD
+|--------------------------------------------------------------------------
+*/
+
+function parseSingleUpload(req, allowedPrefix, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const bb = Busboy({
+      headers: req.headers,
+      limits: { files: 1, fileSize: maxBytes }
+    });
+
+    let fileBuffer = Buffer.alloc(0);
+    let filename = 'upload';
+    let mimeType = '';
+    let tooLarge = false;
+    let sawFile = false;
+
+    bb.on('file', (_field, file, info) => {
+      sawFile = true;
+      filename = info.filename || filename;
+      mimeType = info.mimeType || '';
+      file.on('data', chunk => {
+        fileBuffer = Buffer.concat([fileBuffer, chunk]);
+      });
+      file.on('limit', () => { tooLarge = true; });
+    });
+
+    bb.on('error', reject);
+    bb.on('finish', () => {
+      if (!sawFile || !fileBuffer.length) return reject(new Error('Upload a file.'));
+      if (tooLarge) return reject(new Error('Uploaded file is too large.'));
+      if (!mimeType.startsWith(allowedPrefix)) return reject(new Error(`File must be ${allowedPrefix}*.`));
+      resolve({ buffer: fileBuffer, filename, mimeType });
+    });
+
+    req.pipe(bb);
+  });
+}
+
+app.post('/api/profile/avatar', auth, async (req, res) => {
+  try {
+    const upload = await parseSingleUpload(req, 'image/', 8 * 1024 * 1024);
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(upload.mimeType)) {
+      return res.status(400).json({ message: 'Avatar must be JPEG, PNG or WebP.' });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.sub,
+      { avatarImage: upload.buffer, avatarMime: upload.mimeType },
+      { new: true }
+    );
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ ok: true, user: publicUser(user) });
+  } catch (error) {
+    res.status(400).json({ message: error.message || 'Avatar upload failed.' });
+  }
+});
+
+app.get('/api/profile/avatar', auth, async (req, res) => {
+  const user = await User.findById(req.user.sub).select('avatarImage avatarMime');
+  if (!user?.avatarImage?.length) return res.status(404).end();
+  res.setHeader('Content-Type', user.avatarMime || 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.send(user.avatarImage);
+});
+
+app.delete('/api/profile/avatar', auth, async (req, res) => {
+  await User.findByIdAndUpdate(req.user.sub, { $unset: { avatarImage: 1, avatarMime: 1 } });
+  res.json({ ok: true });
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -1200,10 +1277,6 @@ io.use(
       socket.handshake
         .auth?.token;
 
-    if (!JWT_SECRET) {
-      return next(new Error('Server JWT configuration is missing.'));
-    }
-
     if (!token) {
       return next(
         new Error(
@@ -1216,7 +1289,7 @@ io.use(
       socket.user =
         jwt.verify(
           token,
-          requireJwtSecret()
+          JWT_SECRET()
         );
 
       next();

@@ -5,8 +5,11 @@
   "description": "PhotoCall production WebRTC calling app with human-photo avatar, optional uploaded voice profile, MongoDB auth, Metered TURN and Socket.IO signaling.",
   "scripts": {
     "start": "node backend/server.js",
-    "dev": "node backend/server.js",
-    "vercel-build": "echo PhotoCall backend build complete"
+    "dev": "node --watch backend/server.js",
+    "vercel-build": "echo PhotoCall build complete",
+    "backend:dev": "npm --prefix backend run dev",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build"
   },
   "engines": {
     "node": "24.x"

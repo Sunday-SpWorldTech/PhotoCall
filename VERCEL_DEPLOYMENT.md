@@ -2,79 +2,62 @@
 
 ## Architecture
 
-PhotoCall is a single Node.js + Express application with Socket.IO signaling, MongoDB persistence and WebRTC media. Vercel's current Fluid Compute WebSocket support can host Node WebSocket servers and Socket.IO; enable Fluid compute/WebSockets for the Vercel project if the dashboard asks for it.
+PhotoCall uses a Vercel Node.js Function running Express + Socket.IO, MongoDB for persistence, Metered for WebRTC ICE/TURN configuration, and optional ElevenLabs uploaded-voice processing. Vercel supports WebSocket connections on Fluid Compute; enable Fluid Compute/WebSockets for the backend project if the dashboard presents that option.
 
-## Required Vercel environment variables
+## Backend project
 
-Set these for Production, Preview and Development as appropriate:
+Use the repository root as the Vercel Root Directory and deploy `server.ts` as the backend function. The function exports the HTTP server created by `backend/server.js`.
 
-```env
-MONGODB_URI=mongodb+srv://...
-JWT_SECRET=<new-random-secret>
-JWT_EXPIRES_IN=7d
-METERED_DOMAIN=https://photocallapp.metered.live
-METERED_TURN_API_KEY=<new-turn-credential-api-key>
-```
+## Required Production environment variables
 
-Optional uploaded-voice AI:
-
-```env
-ELEVENLABS_API_KEY=<server-side-elevenlabs-api-key>
-ELEVENLABS_STS_MODEL=eleven_multilingual_sts_v2
-```
-
-Never expose the ElevenLabs API key, MongoDB password, JWT secret or Metered credential API key in frontend code.
-
-## Backend Vercel project
-
-For the dedicated backend project, keep the Vercel **Root Directory at the repository root** because the Vercel entrypoint is `server.ts`. Do not point this backend project at `frontend/`.
-
-The root `server.ts` imports the CommonJS backend with a default import. This avoids the fragile named-import interop that can cause a deployed Node function to fail during initialization. The backend also no longer crashes at module load when a Vercel environment variable is missing; `/health` reports which required configuration is missing instead.
-
-Required Production environment variables:
+Set these in the **backend Vercel project only**:
 
 ```env
 CLIENT_URL=https://photocall-frontend.vercel.app
 CORS_ORIGIN=https://photocall-frontend.vercel.app
-PUBLIC_API_URL=https://photocall-backend.vercel.app
 MONGODB_URI=<your MongoDB URI>
-JWT_SECRET=<your JWT secret>
+JWT_SECRET=<new random secret>
 JWT_EXPIRES_IN=7d
-METERED_DOMAIN=https://photocallapp.metered.live
-METERED_TURN_API_KEY=<your Metered API key>
 TURN_URL=turn:global.relay.metered.ca:443
-TURN_USERNAME=<your Metered TURN username>
-TURN_CREDENTIAL=<your Metered TURN credential>
-ELEVENLABS_API_KEY=<your ElevenLabs key>
+TURN_USERNAME=<your Metered username>
+TURN_CREDENTIAL=<your Metered credential>
+METERED_DOMAIN=https://photocallapp.metered.live
+METERED_TURN_API_KEY=<your Metered credential API key>
+ELEVENLABS_API_KEY=<server-side key, optional>
 ELEVENLABS_STS_MODEL=eleven_multilingual_sts_v2
 ```
 
-Do **not** put these secret values in GitHub, frontend code, or `VITE_*` variables. Add them in the Vercel backend project's **Environment Variables → Production** settings.
+Never put MongoDB, JWT, Metered API or ElevenLabs secrets in the frontend or GitHub.
 
-## Deploy
+## Frontend project
 
-1. Push this repository to GitHub.
-2. Import the repository into Vercel.
-3. Keep the repository root as the Vercel Root Directory.
-4. Select Node.js 24.x if Vercel asks.
-5. Add the environment variables above.
-6. Enable Vercel Fluid Compute/WebSockets for the project when prompted/available.
-7. Deploy.
-8. Open `/health` on the deployment URL.
-9. Create two test accounts in two browsers/devices and test the same room.
+Set these in the **frontend Vercel project**:
 
-## MongoDB Atlas
+```env
+VITE_APP_NAME=PhotoCall
+VITE_API_URL=https://photocall-backend.vercel.app
+VITE_SOCKET_URL=https://photocall-backend.vercel.app
+VITE_PRODUCTION_API_URL=https://photocall-backend.vercel.app
+VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app
+VITE_ENV=production
+```
 
-Allow the deployed Vercel application to reach MongoDB Atlas. Use the least-privileged database user required by this application.
+## Verification
 
-## WebRTC
+After deployment, open:
 
-The browser obtains the ICE server list from `/api/config`. The backend fetches the credential-scoped Metered ICE configuration server-side and returns only the ICE configuration required by WebRTC.
+`https://photocall-backend.vercel.app/health`
 
-## Uploaded voice
+It returns configuration diagnostics without requiring a MongoDB connection. Missing required configuration is reported by name rather than causing an opaque initialization crash.
 
-The optional uploaded-voice flow uses ElevenLabs Instant Voice Cloning and Speech-to-Speech. A user must explicitly choose the uploaded voice. The live browser microphone is converted in short segments, so this is a low-latency segmented voice-conversion mode, not zero-latency native voice cloning.
+## Photo persistence
+
+Uploaded JPEG/PNG/WebP avatars are stored in the authenticated user's MongoDB document and loaded again after login, so the selected human photo is not lost on browser refresh.
+
+## Calling
+
+Socket.IO performs signaling and WebRTC carries the audio/video media. The browser obtains the Metered ICE server list from `/api/config`.
 
 ## Signal
 
-Signal is not used as the WebRTC media transport. A third-party web application cannot simply replace Signal's native call media with its own WebRTC video track. PhotoCall's live media stays in PhotoCall/WebRTC.
+Signal cannot be used by a third-party PhotoCall website as the media transport for PhotoCall's custom avatar WebRTC track. The app can share a PhotoCall invitation through the device's share sheet where Signal is available, while the actual PhotoCall media remains in PhotoCall/WebRTC.

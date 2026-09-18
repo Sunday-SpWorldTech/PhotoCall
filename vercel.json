@@ -1,6 +1,9 @@
 {
   "version": 2,
   "functions": {
-    "server.ts": { "runtime": "nodejs24.x", "maxDuration": 300 }
+    "server.ts": {
+      "runtime": "nodejs24.x",
+      "maxDuration": 300
+    }
   }
 }

@@ -1,8 +1,6 @@
-// Vercel Node.js entrypoint.
-// The backend remains CommonJS so it can also run locally with: node server.js
-// Vercel imports the exported HTTP server and handles the listener/runtime.
+// Vercel entrypoint for the PhotoCall Express + Socket.IO server.
+// backend/server.js is CommonJS, so import its default namespace and export
+// the actual HTTP server that Vercel's Node runtime can serve.
 import backend from './backend/server.js';
 
-const httpServer = (backend as any)?.server ?? backend;
-
-export default httpServer;
+export default backend.server;
