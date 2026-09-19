@@ -1,37 +1,28 @@
-# PhotoCall — Vercel production deployment
+# PhotoCall — production deployment
 
-## Architecture
+## Backend
 
-PhotoCall uses a Vercel Node.js Function running Express + Socket.IO, MongoDB for persistence, Metered for WebRTC ICE/TURN configuration, and optional ElevenLabs uploaded-voice processing. Vercel supports WebSocket connections on Fluid Compute; enable Fluid Compute/WebSockets for the backend project if the dashboard presents that option.
+The backend Vercel project uses the repository root as its Root Directory. The root `server.js` exports the Express + Socket.IO HTTP server from `backend/server.js` for Vercel.
 
-## Backend project
+Production backend:
 
-Use the repository root as the Vercel Root Directory and deploy `server.ts` as the backend function. The function exports the HTTP server created by `backend/server.js`.
+`https://photocall-backend.vercel.app`
 
-## Required Production environment variables
+Health check:
 
-Set these in the **backend Vercel project only**:
+`https://photocall-backend.vercel.app/health`
 
-```env
-CLIENT_URL=https://photocall-frontend.vercel.app
-CORS_ORIGIN=https://photocall-frontend.vercel.app
-MONGODB_URI=<your MongoDB URI>
-JWT_SECRET=<new random secret>
-JWT_EXPIRES_IN=7d
-TURN_URL=turn:global.relay.metered.ca:443
-TURN_USERNAME=<your Metered username>
-TURN_CREDENTIAL=<your Metered credential>
-METERED_DOMAIN=https://photocallapp.metered.live
-METERED_TURN_API_KEY=<your Metered credential API key>
-ELEVENLABS_API_KEY=<server-side key, optional>
-ELEVENLABS_STS_MODEL=eleven_multilingual_sts_v2
-```
+Required backend environment variables are configured in the Vercel backend project, not committed to Git.
 
-Never put MongoDB, JWT, Metered API or ElevenLabs secrets in the frontend or GitHub.
+## Frontend
 
-## Frontend project
+The frontend Vercel project uses the `frontend` directory as its Root Directory.
 
-Set these in the **frontend Vercel project**:
+Production frontend:
+
+`https://photocall-frontend.vercel.app`
+
+Production variables:
 
 ```env
 VITE_APP_NAME=PhotoCall
@@ -42,22 +33,39 @@ VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app
 VITE_ENV=production
 ```
 
-## Verification
+## Local development
 
-After deployment, open:
+Backend:
 
-`https://photocall-backend.vercel.app/health`
+```powershell
+cd "C:\Users\USER\PhotoCall\backend"
+npm install
+npm run dev
+```
 
-It returns configuration diagnostics without requiring a MongoDB connection. Missing required configuration is reported by name rather than causing an opaque initialization crash.
+Frontend:
+
+```powershell
+cd "C:\Users\USER\PhotoCall\frontend"
+npm install
+npm run dev
+```
+
+Local environment values belong in the local `.env` files and are not required for the production Vercel URLs.
 
 ## Photo persistence
 
-Uploaded JPEG/PNG/WebP avatars are stored in the authenticated user's MongoDB document and loaded again after login, so the selected human photo is not lost on browser refresh.
+Authenticated JPEG, PNG and WebP avatars are stored in MongoDB and loaded after login.
 
 ## Calling
 
-Socket.IO performs signaling and WebRTC carries the audio/video media. The browser obtains the Metered ICE server list from `/api/config`.
+PhotoCall uses Socket.IO for signaling and WebRTC for PhotoCall's own media session. TURN/ICE configuration is obtained from `/api/config`.
 
-## Signal
+## Signal on Android
 
-Signal cannot be used by a third-party PhotoCall website as the media transport for PhotoCall's custom avatar WebRTC track. The app can share a PhotoCall invitation through the device's share sheet where Signal is available, while the actual PhotoCall media remains in PhotoCall/WebRTC.
+The native Android shell provides two supported handoff actions:
+
+- **Connect Signal** launches the installed Signal Android app.
+- **Share in Signal** sends the PhotoCall room invitation through Signal's Android share intent.
+
+The official Signal Android application does not expose a public API for a third-party app to replace Signal's camera stream. Therefore PhotoCall does not falsely claim to inject the PhotoCall avatar into an unmodified Signal call. The PhotoCall avatar remains the media source for PhotoCall/WebRTC.

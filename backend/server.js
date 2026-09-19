@@ -1312,6 +1312,14 @@ io.use(
 io.on(
   'connection',
   socket => {
+    // A WebSocket connection can be established without passing through the
+    // normal Express request middleware. Ensure MongoDB is ready before room
+    // state touches Call documents.
+    connectDb().catch(error => {
+      console.error('Socket database connection error:', error.message);
+      socket.emit('server-error', { message: 'Database connection is unavailable.' });
+    });
+
     socket.on(
       'join-room',
       async rawRoom => {

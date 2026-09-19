@@ -49,6 +49,28 @@ class MainActivity : ComponentActivity() {
         fun connectSignal() {
             runOnUiThread { openSignal() }
         }
+
+        @JavascriptInterface
+        fun shareToSignal(text: String) {
+            runOnUiThread { shareTextToSignal(text) }
+        }
+    }
+
+    private fun shareTextToSignal(text: String) {
+        try {
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+                setPackage(signalPackage)
+            }
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "Signal is not installed.", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Unable to share to Signal.", Toast.LENGTH_LONG).show()
+        }
     }
 
     fun openSignal() {
