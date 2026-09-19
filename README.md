@@ -1,25 +1,14 @@
 # PhotoCall
 
-Production-oriented human-avatar WebRTC calling application.
+PhotoCall is a direct-access browser calling app. Users do not register or sign in. They upload a human photo, optionally configure an uploaded voice, start the microphone, and use a shared room code for a live WebRTC call.
 
-## Features
+## Architecture
+- `server.js` / `backend/server.js`: Express + Socket.IO backend for Vercel.
+- `frontend/`: Vite frontend deployed separately.
+- Photo/avatar rendering stays in the browser.
+- Socket.IO handles signaling; WebRTC carries audio/video.
+- Signal is used to send the room invitation.
+- MongoDB and JWT are not required for the direct-access core.
 
-- Account registration/login with JWT + bcrypt
-- MongoDB call/session persistence
-- Socket.IO authenticated signaling
-- Metered STUN/TURN ICE configuration
-- Upload and human-face validation for a caller avatar
-- Independent avatar ON/OFF choice
-- Independent uploaded-voice ON/OFF choice
-- Optional ElevenLabs Instant Voice Clone + Speech-to-Speech conversion
-- Browser voice effects when uploaded voice is disabled
-- WebRTC peer media with avatar canvas and processed/converted audio
-- Vercel Node.js + WebSocket entrypoint (`server.ts`)
-
-## Important
-
-The uploaded-voice feature requires `ELEVENLABS_API_KEY`. Without it, the core WebRTC calling app still works, but uploaded voice cloning/conversion is disabled.
-
-The app does not replace or inject its camera stream into the native Signal call. Signal is used as an external handoff/share channel; the live PhotoCall avatar media is carried by PhotoCall/WebRTC. On Android, the PhotoCall shell can open Signal and share the PhotoCall room invitation.
-
-See `VERCEL_DEPLOYMENT.md` for deployment.
+## Vercel
+Deploy the repository root as the backend project so Vercel detects the root `server.js`. Deploy `frontend/` as the frontend project. See `VERCEL_DEPLOYMENT.md`.

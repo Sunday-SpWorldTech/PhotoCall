@@ -1,6 +1,1 @@
-<resources>
-    <style name="Theme.PhotoCall" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#6750A4</item>
-    </style>
-</resources>
+<resources><style name="Theme.PhotoCall" parent="Theme.AppCompat.DayNight.NoActionBar"><item name="android:windowLightStatusBar">false</item><item name="android:statusBarColor">#070b15</item></style></resources>

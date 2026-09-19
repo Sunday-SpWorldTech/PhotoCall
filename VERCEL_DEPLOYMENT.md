@@ -1,71 +1,37 @@
-# PhotoCall — production deployment
+# PhotoCall production deployment
 
-## Backend
+## Backend Vercel project
 
-The backend Vercel project must be deployed separately from the frontend. If its Root Directory is `backend`, deploy `server.js` as the Node entrypoint. The backend must not serve `frontend/index.html`; `/` returns backend JSON and the frontend remains on its own Vercel project.
+Deploy the repository root as the backend project. The Vercel entrypoint is `server.js`, which exports the Express app directly.
 
-Production backend:
+Set these environment variables in Vercel:
 
-`https://photocall-backend.vercel.app`
+- `CLIENT_URL=https://photocall-frontend.vercel.app`
+- `CORS_ORIGIN=https://photocall-frontend.vercel.app`
+- `PUBLIC_API_URL=https://photocall-backend.vercel.app`
+- `MONGODB_URI=<your MongoDB URI>`
+- `TURN_URL=<your Metered TURN URL>`
+- `TURN_USERNAME=<your Metered username>`
+- `TURN_CREDENTIAL=<your Metered credential>`
+- `METERED_DOMAIN=https://photocallapp.metered.live`
+- `METERED_TURN_API_KEY=<your Metered API key>`
+- `ELEVENLABS_API_KEY=<your ElevenLabs API key>`
+- `ELEVENLABS_STS_MODEL=eleven_multilingual_sts_v2`
 
-Health check:
+`JWT_SECRET` may remain configured for compatibility, but direct-access mode does not require login/JWT.
 
-`https://photocall-backend.vercel.app/health`
+## Frontend Vercel project
 
-Required backend environment variables are configured in the Vercel backend project, not committed to Git.
+Set the root directory to `frontend` and set:
 
-## Frontend
+`VITE_API_URL=https://photocall-backend.vercel.app`
 
-The frontend Vercel project uses the `frontend` directory as its Root Directory.
+`VITE_PRODUCTION_API_URL=https://photocall-backend.vercel.app`
 
-Production frontend:
+`VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app`
 
-`https://photocall-frontend.vercel.app`
+## Verification
 
-Production variables:
+Open the backend URL first. It should return JSON from `/`, and `/health` should report `database: connected` when MongoDB is configured correctly.
 
-```env
-VITE_APP_NAME=PhotoCall
-VITE_API_URL=https://photocall-backend.vercel.app
-VITE_SOCKET_URL=https://photocall-backend.vercel.app
-VITE_PRODUCTION_API_URL=https://photocall-backend.vercel.app
-VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app
-VITE_ENV=production
-```
-
-## Local development
-
-Backend:
-
-```powershell
-cd "C:\Users\USER\PhotoCall\backend"
-npm install
-npm run dev
-```
-
-Frontend:
-
-```powershell
-cd "C:\Users\USER\PhotoCall\frontend"
-npm install
-npm run dev
-```
-
-Local environment values belong in the local `.env` files and are not required for the production Vercel URLs.
-
-## Photo persistence
-
-JPEG, PNG and WebP avatars are stored in MongoDB under an automatically-created guest session. Registration and login are not required in the current direct-access flow.
-
-## Calling
-
-PhotoCall uses Socket.IO for signaling and WebRTC for PhotoCall's own media session. TURN/ICE configuration is obtained from `/api/config`.
-
-## Signal on Android
-
-The native Android shell provides two supported handoff actions:
-
-- **Connect Signal** launches the installed Signal Android app.
-- **Share in Signal** sends the PhotoCall room invitation through Signal's Android share intent.
-
-The official Signal Android application does not expose a public API for a third-party app to replace Signal's camera stream. Therefore PhotoCall cannot inject its avatar into an ordinary Signal video call. The Android app can open Signal and share the PhotoCall invite; the actual PhotoCall media call remains WebRTC.
+The calling path uses REST polling + MongoDB for signaling rather than a process-local Socket.IO room. This avoids relying on a long-lived Node process or in-memory room state in Vercel serverless deployments.
