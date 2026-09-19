@@ -6,7 +6,9 @@ const configuredSocket = import.meta.env.VITE_SOCKET_URL;
 const isProductionHost = window.location.hostname === 'photocall-frontend.vercel.app';
 const API = (isProductionHost ? PRODUCTION_API : (configuredApi || PRODUCTION_API)).replace(/\/$/, '');
 const SOCKET_URL = (isProductionHost ? PRODUCTION_API : (configuredSocket || PRODUCTION_API)).replace(/\/$/, '');
-let socket = null, token = localStorage.getItem('photocall_token'), currentUser = null;
+let socket = null, token = localStorage.getItem('photocall_guest_token'), currentUser = null;
+let guestId = localStorage.getItem('photocall_guest_id') || crypto.randomUUID();
+localStorage.setItem('photocall_guest_id', guestId);
 let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
 let photos = [], selected = 0, img = null, mirrored = false;
 let audioCtx, source, filter, compressor, shaper, analyser, destination, micStream, processedStream;
@@ -22,8 +24,8 @@ async function api(path, options={}) {
   if(!r.ok) throw new Error(data.message||`Request failed (${r.status})`);
   return data;
 }
-function setAuthView(logged){ $('#authCard').classList.toggle('hidden',logged); $('#app').classList.toggle('hidden',!logged); $('#logout').classList.toggle('hidden',!logged); $('#userBadge').classList.toggle('hidden',!logged); if(logged) $('#userBadge').textContent=currentUser.name; }
-function authMessage(t){$('#authMsg').textContent=t||'';} function say(t){$('#msg').textContent=t;}
+function setAuthView(logged){ $('#app').classList.toggle('hidden',!logged); $('#userBadge').classList.toggle('hidden',!logged); if(logged) $('#userBadge').textContent=currentUser?.name || 'Guest'; }
+function authMessage(t){console.warn(t||'');} function say(t){$('#msg').textContent=t;}
 async function loadSavedAvatar(){
   try{
     const r=await fetch(API+'/api/profile/avatar',{headers:{Authorization:'Bearer '+token}});
@@ -37,17 +39,33 @@ async function loadSavedAvatar(){
     loadPhoto();
   }catch(e){console.warn('Saved avatar unavailable',e)}
 }
-async function boot(){ try{ const cfg=await api('/api/config'); iceServers=cfg.iceServers||iceServers; }catch(e){say('TURN configuration is unavailable. Calls may fail on restrictive networks.')} if(token){try{currentUser=(await api('/api/auth/me')).user; avatarEnabledEl.checked=currentUser.avatarEnabled!==false; voiceEnabledEl.checked=!!currentUser.voiceEnabled; uploadedVoiceReady=!!currentUser.voiceReady; voiceStatusEl.textContent=uploadedVoiceReady?'Uploaded voice ready.':'No uploaded voice selected.'; setAuthView(true);await loadSavedAvatar();connectSocket();}catch(e){token=null;localStorage.removeItem('photocall_token');setAuthView(false);}} }
-$('#register').onclick=async()=>{try{const d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:$('#authName').value,email:$('#authEmail').value,password:$('#authPassword').value})}); token=d.token;currentUser=d.user;avatarEnabledEl.checked=true;voiceEnabledEl.checked=false;uploadedVoiceReady=false;localStorage.setItem('photocall_token',token);authMessage('Account created.');setAuthView(true);await loadSavedAvatar();connectSocket();}catch(e){authMessage(e.message)}};
-$('#login').onclick=async()=>{try{const d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:$('#authEmail').value,password:$('#authPassword').value})});token=d.token;currentUser=d.user;avatarEnabledEl.checked=currentUser.avatarEnabled!==false;voiceEnabledEl.checked=!!currentUser.voiceEnabled;uploadedVoiceReady=!!currentUser.voiceReady;voiceStatusEl.textContent=uploadedVoiceReady?'Uploaded voice ready.':'No uploaded voice selected.';localStorage.setItem('photocall_token',token);authMessage('Signed in.');setAuthView(true);await loadSavedAvatar();connectSocket();}catch(e){authMessage(e.message)}};
-$('#logout').onclick=()=>{cleanup(true);socket?.disconnect();socket=null;token=null;currentUser=null;localStorage.removeItem('photocall_token');setAuthView(false);};
-function connectSocket(){ if(socket) return; socket=io(SOCKET_URL,{auth:{token},transports:['websocket','polling']}); socket.on('connect',()=>{$('#status').textContent='Signaling online';$('#status').className='status online';}); socket.on('connect_error',e=>{$('#status').textContent='Signaling error';$('#status').className='status offline';say(e.message||'Signaling authentication failed.');}); socket.on('disconnect',()=>{$('#status').textContent='Signaling offline';$('#status').className='status offline';});
- socket.on('peer-ready',async()=>{if(!pc)return;const offer=await pc.createOffer();await pc.setLocalDescription(offer);socket.emit('offer',{room:$('#room').value.trim(),offer:pc.localDescription});say('Partner found. Connecting…');});
- socket.on('offer',async d=>{if(!pc)return;await pc.setRemoteDescription(d.offer);const answer=await pc.createAnswer();await pc.setLocalDescription(answer);socket.emit('answer',{room:$('#room').value.trim(),answer:pc.localDescription});});
- socket.on('answer',d=>pc?.setRemoteDescription(d.answer).catch(e=>say(e.message)));
- socket.on('ice-candidate',d=>pc?.addIceCandidate(d.candidate).catch(()=>{}));
- socket.on('room-joined',d=>{if(d.peerCount===1){$('#remoteState').textContent='Room created — waiting for partner…';say(`Room “${d.room}” joined. Send the same code to your partner.`);}});
- socket.on('room-full',()=>{say('This room already has two users. Choose another code.');cleanup(false);}); socket.on('server-error',d=>say(d.message||'Server error.')); socket.on('call-ended',()=>{say('Your partner ended the call.');cleanup(false);}); socket.on('peer-left',()=>{say('Your partner left the room.');cleanup(false);}); }
+async function ensureGuestSession(){
+  if(token && currentUser) return currentUser;
+  const d=await api('/api/session/guest',{method:'POST',body:JSON.stringify({guestId})});
+  token=d.token; currentUser=d.user;
+  localStorage.setItem('photocall_guest_token',token);
+  localStorage.setItem('photocall_guest_id',d.guestId||guestId);
+  return currentUser;
+}
+async function boot(){
+  try{
+    await ensureGuestSession();
+    const cfg=await api('/api/config');
+    iceServers=cfg.iceServers||iceServers;
+    avatarEnabledEl.checked=currentUser.avatarEnabled!==false;
+    voiceEnabledEl.checked=!!currentUser.voiceEnabled;
+    uploadedVoiceReady=!!currentUser.voiceReady;
+    voiceStatusEl.textContent=uploadedVoiceReady?'Uploaded voice ready.':'No uploaded voice selected.';
+    setAuthView(true);
+    await loadSavedAvatar();
+    connectSocket();
+    say('PhotoCall is ready. Upload your photo to begin.');
+  }catch(e){
+    console.error(e);
+    setAuthView(true);
+    say(e.message||'PhotoCall could not start. Check the backend configuration.');
+  }
+}
 
 const avatarEnabledEl=$('#avatarEnabled'), voiceEnabledEl=$('#voiceEnabled'), voiceFileEl=$('#voiceFile'), voiceStatusEl=$('#voiceStatus');
 async function savePreferences(){try{const d=await api('/api/profile/preferences',{method:'PATCH',body:JSON.stringify({avatarEnabled:avatarEnabledEl.checked,voiceEnabled:voiceEnabledEl.checked})});currentUser=d.user;uploadedVoiceReady=!!d.user.voiceReady;voiceStatusEl.textContent=d.user.voiceReady?'Uploaded voice ready.':'No uploaded voice selected.';}catch(e){voiceStatusEl.textContent=e.message}}
@@ -103,7 +121,7 @@ $('#mic').onclick=async()=>{try{if(micStream){micStream.getTracks().forEach(t=>t
 $('#mute').onclick=()=>{if(!micStream)return;muted=!muted;micStream.getAudioTracks().forEach(t=>t.enabled=!muted);$('#mute').textContent=muted?'🎙 Unmute':'🔇 Mute'};
 function makePeer(){pc=new RTCPeerConnection({iceServers});pc.onicecandidate=e=>e.candidate&&socket.emit('ice-candidate',{room:$('#room').value.trim(),candidate:e.candidate});pc.ontrack=e=>{remote.srcObject=e.streams[0];$('#remoteState').textContent='Connected — live avatar + processed voice';startTimer();remote.play().catch(()=>{})};pc.onconnectionstatechange=()=>{if(!pc)return;$('#remoteState').textContent=`Connection: ${pc.connectionState}`;if(['failed','closed'].includes(pc.connectionState)&&joined)cleanup(false)};pc.oniceconnectionstatechange=()=>{if(pc?.iceConnectionState==='failed')say('WebRTC ICE failed. Check the Metered TURN configuration and network.');};return pc;}
 async function outgoing(){if(avatarEnabledEl.checked&&!img)throw new Error('Upload a human photo first or turn off Use human avatar.');if(photoValidation.textContent.includes('no human face')||photoValidation.textContent.includes('no face detected'))throw new Error('Please upload a clear human face photo before starting the call.');if(!micStream)await startMic();const vs=avatarEnabledEl.checked?canvas.captureStream(30):new MediaStream(),ats=processedStream?.getAudioTracks()||[];if(!ats.length)throw new Error('Processed microphone audio is unavailable.');return new MediaStream([...vs.getVideoTracks(),...ats]);}
-$('#call').onclick=async()=>{try{if(!socket)throw new Error('Please sign in first.');const room=$('#room').value.trim();if(!room)throw new Error('Enter a room code.');outgoingStream=await outgoing();makePeer();outgoingStream.getTracks().forEach(t=>pc.addTrack(t,outgoingStream));const d=await api('/api/calls',{method:'POST',body:JSON.stringify({room})});callId=d.id;socket.emit('join-room',room);joined=true;$('#call').disabled=true;$('#hang').disabled=false;$('#room').disabled=true;$('#remoteState').textContent='Waiting for your partner…';}catch(e){say(e.message)}};
+$('#call').onclick=async()=>{try{if(!socket)throw new Error('PhotoCall signaling is not connected yet.');const room=$('#room').value.trim();if(!room)throw new Error('Enter a room code.');outgoingStream=await outgoing();makePeer();outgoingStream.getTracks().forEach(t=>pc.addTrack(t,outgoingStream));const d=await api('/api/calls',{method:'POST',body:JSON.stringify({room})});callId=d.id;socket.emit('join-room',room);joined=true;$('#call').disabled=true;$('#hang').disabled=false;$('#room').disabled=true;$('#remoteState').textContent='Waiting for your partner…';}catch(e){say(e.message)}};
 function inviteText(){const url=new URL('/receiver.html?room='+encodeURIComponent($('#room').value.trim()),window.location.href).href;return `Join my PhotoCall call: ${url}\nRoom: ${$('#room').value.trim()}`;}
 document.querySelector('#connectSignal')?.addEventListener('click',()=>{if(window.PhotoCallAndroid?.connectSignal){window.PhotoCallAndroid.connectSignal();say('Signal opened. Keep the PhotoCall avatar session active while making the Signal call.');}else{say('Signal connection is available from the PhotoCall Android app.');}});
 $('#shareSignal').onclick=async()=>{const text=inviteText();try{if(window.PhotoCallAndroid?.shareToSignal){window.PhotoCallAndroid.shareToSignal(text);say('Signal share opened. Keep PhotoCall available while you complete the Signal call.');return;}if(navigator.share){await navigator.share({title:'PhotoCall call',text});say('Share opened. Choose Signal to send the PhotoCall invite.');}else{await navigator.clipboard.writeText(text);say('PhotoCall invite copied. Open Signal and paste it into your chat.');}}catch(e){if(e.name!=='AbortError')say('Unable to open sharing. The invite was not sent.');}};

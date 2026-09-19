@@ -2,7 +2,7 @@
 
 ## Backend
 
-The backend Vercel project uses the repository root as its Root Directory. Vercel uses the root `server.ts` Node.js entrypoint, which exports the Express + Socket.IO HTTP server from `backend/server.js`. This is the current Vercel Node-server/WebSocket deployment pattern.
+The backend Vercel project must be deployed separately from the frontend. If its Root Directory is `backend`, deploy `server.js` as the Node entrypoint. The backend must not serve `frontend/index.html`; `/` returns backend JSON and the frontend remains on its own Vercel project.
 
 Production backend:
 
@@ -55,7 +55,7 @@ Local environment values belong in the local `.env` files and are not required f
 
 ## Photo persistence
 
-Authenticated JPEG, PNG and WebP avatars are stored in MongoDB and loaded after login.
+JPEG, PNG and WebP avatars are stored in MongoDB under an automatically-created guest session. Registration and login are not required in the current direct-access flow.
 
 ## Calling
 
@@ -68,4 +68,4 @@ The native Android shell provides two supported handoff actions:
 - **Connect Signal** launches the installed Signal Android app.
 - **Share in Signal** sends the PhotoCall room invitation through Signal's Android share intent.
 
-The official Signal Android application does not expose a public API for a third-party app to replace Signal's camera stream. Therefore PhotoCall does not falsely claim to inject the PhotoCall avatar into an unmodified Signal call. The PhotoCall avatar remains the media source for PhotoCall/WebRTC.
+The official Signal Android application does not expose a public API for a third-party app to replace Signal's camera stream. Therefore PhotoCall cannot inject its avatar into an ordinary Signal video call. The Android app can open Signal and share the PhotoCall invite; the actual PhotoCall media call remains WebRTC.

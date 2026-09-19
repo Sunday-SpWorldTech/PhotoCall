@@ -1,4 +1,5 @@
 const path = require('path');
+const crypto = require('crypto');
 
 require('dotenv').config({
   path: path.join(__dirname, '.env')
@@ -99,7 +100,7 @@ async function connectDb() {
 app.use(async (req, _res, next) => {
   // Diagnostics and ICE configuration must remain available even when MongoDB
   // is temporarily unavailable; authenticated/data routes still require DB.
-  if (req.path === '/health' || req.path === '/api/config') {
+  if (req.path === '/' || req.path === '/health' || req.path === '/api/config') {
     return next();
   }
 
@@ -181,6 +182,13 @@ const User = mongoose.model(
           'failed'
         ],
         default: 'none'
+      },
+
+      guestId: {
+        type: String,
+        unique: true,
+        sparse: true,
+        index: true
       },
 
       createdAt: {
@@ -463,6 +471,40 @@ app.get(
 | REGISTER
 |--------------------------------------------------------------------------
 */
+
+app.post(
+  '/api/session/guest',
+  async (req, res) => {
+    try {
+      let guestId = String(req.body?.guestId || '').trim();
+      if (!/^[a-zA-Z0-9_-]{16,100}$/.test(guestId)) {
+        guestId = crypto.randomUUID();
+      }
+
+      let user = await User.findOne({ guestId });
+      if (!user) {
+        const randomPassword = crypto.randomBytes(32).toString('hex');
+        user = await User.create({
+          name: 'PhotoCall User',
+          email: `guest-${guestId}@guest.photocall.local`,
+          passwordHash: await bcrypt.hash(randomPassword, 8),
+          guestId,
+          avatarEnabled: true
+        });
+      }
+
+      res.json({
+        guest: true,
+        guestId,
+        token: sign(user),
+        user: publicUser(user)
+      });
+    } catch (error) {
+      console.error('Guest session error:', error);
+      res.status(500).json({ message: 'Unable to start PhotoCall guest session.' });
+    }
+  }
+);
 
 app.post(
   '/api/auth/register',
@@ -1563,43 +1605,20 @@ async function leave(socket) {
 
 /*
 |--------------------------------------------------------------------------
-| FRONTEND STATIC FILES
+| BACKEND ROOT
 |--------------------------------------------------------------------------
+| The frontend is deployed separately. Never serve frontend/index.html from
+| the backend project, otherwise the two Vercel deployments appear identical.
 */
 
-app.use(
-  express.static(
-    path.join(
-      __dirname,
-      '../frontend'
-    )
-  )
-);
-
-app.get(
-  '*',
-  (req, res, next) => {
-    if (
-      req.path.startsWith(
-        '/api/'
-      ) ||
-      req.path ===
-        '/health' ||
-      req.path.startsWith(
-        '/socket.io/'
-      )
-    ) {
-      return next();
-    }
-
-    res.sendFile(
-      path.join(
-        __dirname,
-        '../frontend/index.html'
-      )
-    );
-  }
-);
+app.get('/', (_req, res) => {
+  res.json({
+    service: 'PhotoCall Backend API',
+    ok: true,
+    frontend: CLIENT_URL,
+    health: '/health'
+  });
+});
 
 /*
 |--------------------------------------------------------------------------
