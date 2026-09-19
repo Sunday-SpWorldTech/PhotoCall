@@ -2,7 +2,7 @@
 
 ## Backend
 
-The backend Vercel project uses the repository root as its Root Directory. The root `server.js` exports the Express + Socket.IO HTTP server from `backend/server.js` for Vercel.
+The backend Vercel project uses the repository root as its Root Directory. Vercel uses the root `server.ts` Node.js entrypoint, which exports the Express + Socket.IO HTTP server from `backend/server.js`. This is the current Vercel Node-server/WebSocket deployment pattern.
 
 Production backend:
 

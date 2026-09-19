@@ -20,6 +20,6 @@ Production-oriented human-avatar WebRTC calling application.
 
 The uploaded-voice feature requires `ELEVENLABS_API_KEY`. Without it, the core WebRTC calling app still works, but uploaded voice cloning/conversion is disabled.
 
-The app does not embed native Signal calling. Signal can be used as an external communication channel; live media is carried by PhotoCall/WebRTC.
+The app does not replace or inject its camera stream into the native Signal call. Signal is used as an external handoff/share channel; the live PhotoCall avatar media is carried by PhotoCall/WebRTC. On Android, the PhotoCall shell can open Signal and share the PhotoCall room invitation.
 
 See `VERCEL_DEPLOYMENT.md` for deployment.
