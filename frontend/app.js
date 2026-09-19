@@ -13,7 +13,7 @@ let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
 let pollTimer = null, lastEventId = '000000000000000000000000';
 let roomJoined = false;
 let photos = [], selected = 0, img = null, mirrored = false;
-let faceBox = null;
+let faceBox = null, faceLandmarks = null, faceBase = null, faceTriangles = null, faceState = null, avatarReady = false, sourceCanvas = document.createElement('canvas'), sourceCtx = sourceCanvas.getContext('2d');
 let audioCtx, source, filter, compressor, shaper, analyser, destination, micStream, processedStream;
 let voiceRecorder = null, voiceCloneQueueTime = 0, uploadedVoiceReady = false;
 let pc = null, muted = false, voiceMode = 'normal', audioLevel = 0, timerStart = 0, timerHandle = null, outgoingStream = null;
@@ -177,126 +177,244 @@ function galleryRender() {
   });
 }
 
-async function validateHumanPhoto(image) {
-  photoValidation.textContent = 'Photo check: detecting human face…';
-  faceBox = null;
-  try {
-    if (window.Human?.Human) {
-      if (!window._photoCallHuman) {
-        window._photoCallHuman = new window.Human.Human({
-          backend: 'webgl',
-          modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
-          face: { enabled: true, detector: { rotation: false, return: true }, mesh: { enabled: false }, iris: { enabled: false }, description: { enabled: false }, emotion: { enabled: false }, antispoof: { enabled: false }, liveness: { enabled: false } },
-          body: { enabled: false }, hand: { enabled: false }, object: { enabled: false }, gesture: { enabled: false }, segmentation: { enabled: false }, debug: false
-        });
-        await window._photoCallHuman.load();
-        await window._photoCallHuman.warmup();
-      }
-      const result = await window._photoCallHuman.detect(image);
-      if (!Array.isArray(result.face) || !result.face.length) throw new Error('No human face detected');
-      const box = result.face[0].box;
-      if (box && box.length >= 4) faceBox = box;
-      photoValidation.textContent = 'Human face detected. Live avatar animation is ready.';
-      return true;
+async function loadFaceLandmarker() {
+  if (window._photoCallFaceLandmarker) return window._photoCallFaceLandmarker;
+  if (!window._photoCallVisionPromise) {
+    window._photoCallVisionPromise = import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');
+  }
+  const { FaceLandmarker, FilesetResolver } = await window._photoCallVisionPromise;
+  const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
+  window._photoCallFaceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+      delegate: 'GPU'
+    },
+    runningMode: 'IMAGE',
+    numFaces: 1,
+    minFaceDetectionConfidence: 0.5,
+    minFacePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: true
+  });
+  return window._photoCallFaceLandmarker;
+}
+
+function imageToCanvasPoint(lm, image = img) {
+  const cw = canvas.width, ch = canvas.height;
+  const scale = Math.max(cw / image.width, ch / image.height);
+  const w = image.width * scale, h = image.height * scale;
+  return { x: (lm.x * image.width - image.width / 2) * scale + cw / 2, y: (lm.y * image.height - image.height / 2) * scale + ch / 2 };
+}
+
+function buildFaceTriangles(points) {
+  // Bowyer-Watson Delaunay triangulation. We use the detected face points only,
+  // which produces a dense mesh for photo deformation without a native dependency.
+  const pts = points.map((p, i) => ({ x: p.x, y: p.y, i }));
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
+  const dx = maxX - minX || 1, dy = maxY - minY || 1, delta = Math.max(dx, dy) * 20;
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const superPts = [
+    { x: cx - 2 * delta, y: cy - delta, i: -1 },
+    { x: cx, y: cy + 2 * delta, i: -2 },
+    { x: cx + 2 * delta, y: cy - delta, i: -3 }
+  ];
+  const all = pts.concat(superPts);
+  const superA = pts.length, superB = pts.length + 1, superC = pts.length + 2;
+  let triangles = [[superA, superB, superC]];
+  const circum = (a, b, c) => {
+    const A = b.x - a.x, B = b.y - a.y, C = c.x - a.x, D = c.y - a.y;
+    const E = A * (a.x + b.x) + B * (a.y + b.y);
+    const F = C * (a.x + c.x) + D * (a.y + c.y);
+    const G = 2 * (A * (c.y - b.y) - B * (c.x - b.x));
+    if (Math.abs(G) < 1e-8) return { x: 0, y: 0, r2: Infinity };
+    const x = (D * E - B * F) / G, y = (A * F - C * E) / G;
+    return { x, y, r2: (x - a.x) ** 2 + (y - a.y) ** 2 };
+  };
+  const edgeKey = (a, b) => a < b ? `${a}:${b}` : `${b}:${a}`;
+  for (let pi = 0; pi < pts.length; pi++) {
+    const p = all[pi], bad = [];
+    for (let ti = 0; ti < triangles.length; ti++) {
+      const [a, b, c] = triangles[ti], cc = circum(all[a], all[b], all[c]);
+      if ((p.x - cc.x) ** 2 + (p.y - cc.y) ** 2 <= cc.r2 + 0.01) bad.push(ti);
     }
-  } catch (e) { console.warn('Face detection:', e); }
-  photoValidation.textContent = 'Photo loaded. Use a clear front-facing human photo.';
-  return true;
+    const edges = new Map();
+    for (let k = bad.length - 1; k >= 0; k--) {
+      const tri = triangles[bad[k]];
+      triangles.splice(bad[k], 1);
+      [[tri[0], tri[1]], [tri[1], tri[2]], [tri[2], tri[0]]].forEach(([a, b]) => {
+        const key = edgeKey(a, b);
+        const old = edges.get(key);
+        if (old) old.count++;
+        else edges.set(key, { a, b, count: 1 });
+      });
+    }
+    for (const e of edges.values()) if (e.count === 1) triangles.push([e.a, e.b, pi]);
+  }
+  return triangles.filter(([a,b,c]) => a < pts.length && b < pts.length && c < pts.length);
+}
+
+function calculateFaceState(landmarks) {
+  const get = i => landmarks[i] || { x: 0.5, y: 0.5 };
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const mouth = dist(get(13), get(14));
+  const mouthWidth = Math.max(0.001, dist(get(61), get(291)));
+  const leftEye = dist(get(159), get(145));
+  const rightEye = dist(get(386), get(374));
+  const leftEyeWidth = Math.max(0.001, dist(get(33), get(133)));
+  const rightEyeWidth = Math.max(0.001, dist(get(362), get(263)));
+  return { mouthRatio: mouth / mouthWidth, eyeL: leftEye / leftEyeWidth, eyeR: rightEye / rightEyeWidth };
+}
+
+async function validateHumanPhoto(image) {
+  photoValidation.textContent = 'Photo check: detecting face + landmarks…';
+  faceBox = null; faceLandmarks = null; faceTriangles = null; faceBase = null; faceState = null;
+  try {
+    const landmarker = await loadFaceLandmarker();
+    const result = landmarker.detect(image);
+    const landmarks = result.faceLandmarks?.[0];
+    if (!landmarks || landmarks.length < 400) throw new Error('No complete human face landmark mesh detected.');
+    faceLandmarks = landmarks;
+    faceBase = landmarks.map(p => imageToCanvasPoint(p, image));
+    const meshIndices = [];
+    for (let i = 0; i < faceBase.length; i++) {
+      if (i % 4 === 0 || [10,13,14,33,61,70,78,95,105,133,145,152,159,234,263,291,300,308,334,362,374,386,454].includes(i)) meshIndices.push(i);
+    }
+    const reduced = meshIndices.map(i => faceBase[i]);
+    const localTriangles = buildFaceTriangles(reduced);
+    faceTriangles = localTriangles.map(([a,b,c]) => [meshIndices[a], meshIndices[b], meshIndices[c]]);
+    sourceCanvas.width = canvas.width; sourceCanvas.height = canvas.height;
+    sourceCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+    drawCoverOnContext(sourceCtx, image, mirrored, 0, 0, 1);
+    faceBase = faceBase.map((pt) => mirrored ? { x: canvas.width - pt.x, y: pt.y } : pt);
+    faceState = calculateFaceState(landmarks);
+    const xs = faceBase.map(p => p.x), ys = faceBase.map(p => p.y);
+    faceBox = [Math.min(...xs), Math.min(...ys), Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)];
+    photoValidation.textContent = `Human face detected: ${landmarks.length} landmarks. Avatar deformation engine ready.`;
+    avatarReady = true;
+    return true;
+  } catch (e) {
+    console.error('Face landmark engine:', e);
+    avatarReady = false;
+    photoValidation.textContent = `Face animation could not initialize: ${e.message}`;
+    return false;
+  }
 }
 
 function loadPhoto() {
   if (!photos.length) {
-    img = null; faceBox = null; hint.classList.remove('hidden');
-    $('#photoInfo').textContent = 'No photo selected';
-    photoValidation.textContent = 'Photo check: waiting for an image.';
-    return;
+    img = null; faceBox = null; faceLandmarks = null; faceTriangles = null; faceBase = null; avatarReady = false;
+    hint.classList.remove('hidden'); $('#photoInfo').textContent = 'No photo selected';
+    photoValidation.textContent = 'Photo check: waiting for an image.'; return;
   }
-  hint.classList.add('hidden');
-  $('#photoInfo').textContent = `${selected + 1} / ${photos.length} selected`;
-  img = new Image();
-  img.onload = async () => { await validateHumanPhoto(img); drawAvatar(); };
-  img.src = photos[selected].url;
+  hint.classList.add('hidden'); $('#photoInfo').textContent = `${selected + 1} / ${photos.length} selected`;
+  img = new Image(); img.onload = async () => { await validateHumanPhoto(img); drawAvatar(); }; img.src = photos[selected].url;
 }
 
 files.onchange = e => {
   const picked = [...e.target.files].filter(f => /^image\/(jpeg|png|webp)$/.test(f.type));
   picked.forEach(file => photos.push({ url: URL.createObjectURL(file), name: file.name, file }));
-  if (picked.length) {
-    selected = photos.length - 1;
-    galleryRender();
-    loadPhoto();
-    say(`${picked.length} photo${picked.length === 1 ? '' : 's'} ready. Start your microphone to animate the avatar.`);
-  }
+  if (picked.length) { selected = photos.length - 1; galleryRender(); loadPhoto(); say(`${picked.length} photo${picked.length === 1 ? '' : 's'} ready. PhotoCall is building the facial landmark mesh now.`); }
 };
 
-$('#flip').onclick = () => { mirrored = !mirrored; drawAvatar(); };
+$('#flip').onclick = () => { mirrored = !mirrored; if (img) loadPhoto(); else drawAvatar(); };
 $('#reset').onclick = () => { photos.forEach(p => URL.revokeObjectURL(p.url)); photos = []; selected = 0; loadPhoto(); galleryRender(); say('Avatar reset.'); };
 
-function drawCover(image, swayX = 0, swayY = 0, scaleBoost = 1) {
-  const cw = canvas.width, ch = canvas.height;
-  const scale = Math.max(cw / image.width, ch / image.height) * scaleBoost;
+function drawCoverOnContext(targetCtx, image, mirror = mirrored, swayX = 0, swayY = 0, scaleBoost = 1) {
+  const cw = canvas.width, ch = canvas.height, scale = Math.max(cw / image.width, ch / image.height) * scaleBoost;
   const w = image.width * scale, h = image.height * scale;
+  targetCtx.save(); targetCtx.translate(cw / 2 + swayX, ch / 2 + swayY); targetCtx.scale(mirror ? -1 : 1, 1); targetCtx.drawImage(image, -w / 2, -h / 2, w, h); targetCtx.restore();
+}
+function drawCover(image, swayX = 0, swayY = 0, scaleBoost = 1) { drawCoverOnContext(ctx, image, mirrored, swayX, swayY, scaleBoost); }
+
+function affineForTriangle(s0, s1, s2, t0, t1, t2) {
+  const dx1 = s1.x - s0.x, dy1 = s1.y - s0.y, dx2 = s2.x - s0.x, dy2 = s2.y - s0.y;
+  const det = dx1 * dy2 - dx2 * dy1;
+  if (Math.abs(det) < 0.0001) return null;
+  const a = ((t1.x - t0.x) * dy2 - (t2.x - t0.x) * dy1) / det;
+  const c = ((t2.x - t0.x) * dx1 - (t1.x - t0.x) * dx2) / det;
+  const b = ((t1.y - t0.y) * dy2 - (t2.y - t0.y) * dy1) / det;
+  const d = ((t2.y - t0.y) * dx1 - (t1.y - t0.y) * dx2) / det;
+  return { a, b, c, d, e: t0.x - a * s0.x - c * s0.y, f: t0.y - b * s0.x - d * s0.y };
+}
+
+function animatedFacePoints() {
+  if (!faceBase?.length) return null;
+  const p = faceBase.map(v => ({ x: v.x, y: v.y }));
+  const t = avatarTime;
+  const talk = Math.min(1, audioLevel * 1.9);
+  const blink = Math.max(0, Math.sin(t * 0.42 - 0.7)) ** 36;
+  const nod = Math.sin(t * 0.85) * (1.2 + talk * 2.0);
+  const tilt = Math.sin(t * 0.63) * 0.008;
+  const faceCx = (p[234]?.x + p[454]?.x) / 2 || canvas.width / 2;
+  const faceCy = (p[10]?.y + p[152]?.y) / 2 || canvas.height / 2;
+  const move = (idx, dx, dy) => { if (p[idx]) { p[idx].x += dx; p[idx].y += dy; } };
+  const around = (idx, sx, sy) => {
+    if (!p[idx]) return;
+    const dx = p[idx].x - faceCx, dy = p[idx].y - faceCy;
+    p[idx].x += dx * sx + dy * sy;
+    p[idx].y += dy * sx - dx * sy;
+  };
+  // Whole-head micro motion.
+  for (let i = 0; i < p.length; i++) {
+    p[i].x += Math.sin(t * 0.9) * 0.8 + Math.sin(t * 1.7 + i * 0.02) * talk * 0.25;
+    p[i].y += nod;
+    around(i, 0.0001, tilt);
+  }
+  // Jaw/lips: speech drives a real landmark mesh rather than painting a mouth ellipse.
+  const mouthOpen = Math.min(18, 1.5 + talk * (5 + Math.max(1, faceBase[152]?.y - faceBase[13]?.y) * 0.035));
+  [13,14,12,15,16,17,18,19,20,21].forEach(i => move(i, 0, i === 14 || i === 17 || i === 18 ? mouthOpen : mouthOpen * 0.25));
+  [78,308,95,324].forEach(i => move(i, 0, mouthOpen * 0.55));
+  [152,149,150,176,148].forEach(i => move(i, 0, talk * 2.2));
+  // Eyelid compression gives visible blinking while preserving the original eye texture.
+  const leftEye = [33,133,159,145,160,144,158,153,155,154];
+  const rightEye = [362,263,386,374,387,373,385,380,382,381];
+  leftEye.forEach(i => move(i, 0, (p[i].y - faceCy) * blink * -0.03));
+  rightEye.forEach(i => move(i, 0, (p[i].y - faceCy) * blink * -0.03));
+  [70,63,105,66,107,336,296,334,293,300].forEach(i => move(i, 0, -blink * 0.4));
+  return p;
+}
+
+function drawDeformedFace() {
+  if (!img || !faceBase || !faceTriangles?.length) return;
+  const target = animatedFacePoints();
+  if (!target) return;
   ctx.save();
-  ctx.translate(cw / 2 + swayX, ch / 2 + swayY);
-  ctx.scale(mirrored ? -1 : 1, 1);
-  ctx.drawImage(image, -w / 2, -h / 2, w, h);
+  // Draw the face mesh triangles over the original photo. The deformation is subtle
+  // enough to keep skin texture intact while moving eyes, brows, lips and jaw together.
+  for (const tri of faceTriangles) {
+    const [ia, ib, ic] = tri;
+    const s0 = faceBase[ia], s1 = faceBase[ib], s2 = faceBase[ic];
+    const t0 = target[ia], t1 = target[ib], t2 = target[ic];
+    const m = affineForTriangle(s0, s1, s2, t0, t1, t2);
+    if (!m) continue;
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(t0.x, t0.y); ctx.lineTo(t1.x, t1.y); ctx.lineTo(t2.x, t2.y); ctx.closePath(); ctx.clip();
+    ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
+    const pad = 2;
+    ctx.drawImage(sourceCanvas, -pad, -pad, sourceCanvas.width + pad * 2, sourceCanvas.height + pad * 2, -pad, -pad, sourceCanvas.width + pad * 2, sourceCanvas.height + pad * 2);
+    ctx.restore();
+  }
   ctx.restore();
 }
 
 function drawAvatar() {
-  ctx.fillStyle = '#070b15';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  if (!img) return;
-
-  const t = avatarTime;
-  const talkingAmount = Math.min(1, audioLevel * 1.7);
-  const swayX = Math.sin(t * 1.15) * (1.5 + talkingAmount * 2.5);
-  const swayY = Math.sin(t * 0.75) * (1 + talkingAmount * 1.5);
-  const zoom = 1 + Math.sin(t * 0.9) * 0.004;
-  drawCover(img, swayX, swayY, zoom);
-
-  // Lightweight photo-puppet animation: mouth movement, blink and breathing/head motion.
-  const cx = canvas.width * 0.5;
-  const cy = canvas.height * 0.69;
-  const mouthOpen = 3 + talkingAmount * 28 + Math.abs(Math.sin(t * 7.5)) * talkingAmount * 8;
-  const blink = Math.pow(Math.max(0, Math.sin(t * 0.55 - 1.3)), 32);
-
-  ctx.save();
-  ctx.globalAlpha = 0.78;
-  ctx.fillStyle = '#160b14';
-  ctx.beginPath();
-  ctx.ellipse(cx, cy + swayY, 38 + talkingAmount * 4, mouthOpen, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.globalAlpha = 0.9;
-  ctx.strokeStyle = '#f2b6b6';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(cx - 28, cy + swayY);
-  ctx.quadraticCurveTo(cx, cy + swayY + talkingAmount * 9, cx + 28, cy + swayY);
-  ctx.stroke();
-
-  if (blink > 0.8) {
-    ctx.globalAlpha = 0.32;
-    ctx.fillStyle = '#080b15';
-    ctx.fillRect(cx - 118, cy - 116, 72, 10);
-    ctx.fillRect(cx + 46, cy - 116, 72, 10);
-  }
-  ctx.restore();
+  ctx.fillStyle = '#070b15'; ctx.fillRect(0, 0, canvas.width, canvas.height); if (!img) return;
+  const t = avatarTime, talk = Math.min(1, audioLevel * 1.9);
+  drawCover(img, Math.sin(t * 1.05) * (1 + talk * 1.5), Math.sin(t * .72) * (1 + talk), 1 + Math.sin(t * .55) * .002);
+  if (avatarReady) drawDeformedFace();
+  if (!avatarReady) { ctx.fillStyle = 'rgba(120,80,160,.25)'; ctx.fillRect(0,0,canvas.width,canvas.height); }
 }
 
 function animation() {
   avatarTime = performance.now() / 1000;
   if (analyser) {
-    const a = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(a);
-    let sum = 0;
+    const a = new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(a); let sum = 0;
     for (const v of a) { const n = (v - 128) / 128; sum += n * n; }
-    const target = Math.min(1, Math.sqrt(sum / a.length) * 5);
-    audioLevel += (target - audioLevel) * .25;
+    const target = Math.min(1, Math.sqrt(sum / a.length) * 5); audioLevel += (target - audioLevel) * .25;
   } else audioLevel *= .9;
-  meterBar.style.width = `${Math.round(audioLevel * 100)}%`;
-  talking.classList.toggle('hidden', !img || audioLevel < .035);
-  drawAvatar();
+  meterBar.style.width = `${Math.round(audioLevel * 100)}%`; talking.classList.toggle('hidden', !img || audioLevel < .035); drawAvatar();
   animationFrame = requestAnimationFrame(animation);
 }
 animation();

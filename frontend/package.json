@@ -11,9 +11,7 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "socket.io-client": "^4.8.1"
-  },
+  "dependencies": {},
   "devDependencies": {
     "vite": "^7.1.7"
   }
