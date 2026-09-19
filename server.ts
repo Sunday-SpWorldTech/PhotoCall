@@ -1,7 +1,8 @@
-// Vercel Node.js server entrypoint.
-// Vercel manages the HTTP/WebSocket listener; the application itself remains
-// in backend/server.js for local development and the Android WebView client.
+// PhotoCall production Node.js entrypoint for Vercel.
+// The backend module exports the actual Node HTTP server, which is also
+// accepted if Vercel is configured with the `backend` directory as Root.
 // @ts-nocheck
-const { server } = require('./backend/server.js');
+const server = require('./backend/server.js');
 
+// Vercel's Node server runtime accepts the server export.
 export default server;

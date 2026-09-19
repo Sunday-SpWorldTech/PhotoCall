@@ -1674,9 +1674,13 @@ if (
 |--------------------------------------------------------------------------
 */
 
-module.exports = {
-  app,
-  server,
-  io,
-  connectDb
-};
+// Export the actual HTTP server as the CommonJS default export.
+// Vercel may deploy this file directly when the project's Root Directory is
+// set to `backend`; in that mode Vercel requires the module itself to export
+// a function or server. Keeping the properties attached to the server also
+// preserves the named access used by the root server.ts entrypoint.
+module.exports = server;
+module.exports.server = server;
+module.exports.app = app;
+module.exports.io = io;
+module.exports.connectDb = connectDb;
