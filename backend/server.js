@@ -10,20 +10,7 @@ const FRONTEND_URL = process.env.CLIENT_URL || 'https://photocall-frontend.verce
 const app = express();
 
 app.set('trust proxy', 1);
-const allowedOrigins = new Set([
-  FRONTEND_URL,
-  process.env.CORS_ORIGIN,
-  'https://photocall-frontend.vercel.app'
-].filter(Boolean));
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.has(origin) || /\.vercel\.app$/.test(origin)) return callback(null, true);
-    return callback(null, false);
-  },
-  credentials: false,
-  methods: ['GET','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','X-Guest-Id']
-}));
+app.use(cors({ origin: true, credentials: false, methods: ['GET','POST','DELETE','OPTIONS'] }));
 app.use(express.json({ limit: '2mb' }));
 
 let mongoPromise = null;

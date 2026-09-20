@@ -1,5 +1,3 @@
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
-
 const $ = (s) => document.querySelector(s);
 
 const candidates = [
@@ -51,21 +49,13 @@ async function fetchTimeout(url, options = {}, ms = 12000) {
 
 async function discoverBackend() {
   let last;
-  // Vercel serverless deployments commonly expose the Express handler under
-  // /api, so do not treat /health or / as the only valid probes.
-  const probes = ['/api/config', '/health', '/'];
   for (const base of [...new Set(candidates)]) {
-    for (const path of probes) {
+    for (const path of ['/health', '/']) {
       try {
-        const r = await fetchTimeout(`${base}${path}`, {}, 12000);
-        if (r.ok) {
-          API = base;
-          return;
-        }
+        const r = await fetchTimeout(`${base}${path}`);
+        if (r.ok) { API = base; return; }
         last = new Error(`${base}${path} returned ${r.status}`);
-      } catch (e) {
-        last = e;
-      }
+      } catch (e) { last = e; }
     }
   }
   throw new Error(`PhotoCall backend is unreachable. ${last?.message || 'Check the Vercel backend deployment and VITE_API_URL.'}`);
@@ -159,17 +149,29 @@ async function handleEvent(e) {
 }
 
 async function boot() {
+  status('Connecting…');
   try {
-    status('Connecting…');
     await discoverBackend();
-    await startGuestSession();
-    await loadConfig();
-    status('Ready', true);
-    say('PhotoCall backend is online. Upload a clear human photo and PhotoCall will build the facial avatar automatically.');
+    status('Backend online', true);
   } catch (e) {
     console.error(e);
     status('Backend offline');
     say(e.message || 'PhotoCall backend is unavailable.');
+    return;
+  }
+
+  // Avatar creation is client-side and must remain usable even if the optional
+  // database/session layer is temporarily unavailable. This prevents a backend
+  // session problem from incorrectly blocking photo animation.
+  try {
+    await startGuestSession();
+    await loadConfig();
+    status('Ready', true);
+    say('PhotoCall is ready. Upload a clear human photo — the preview will animate automatically, then microphone audio can drive the mouth during a call.');
+  } catch (e) {
+    console.warn('Backend session/config unavailable:', e);
+    status('Backend online • session unavailable', true);
+    say('Avatar preview is ready. Backend session services are temporarily unavailable; calling/signaling will require the backend session to recover.');
   }
 }
 
@@ -189,50 +191,28 @@ function galleryRender() {
 
 async function loadFaceLandmarker() {
   if (window._photoCallFaceLandmarker) return window._photoCallFaceLandmarker;
-  if (!FaceLandmarker || !FilesetResolver) throw new Error('MediaPipe FaceLandmarker is unavailable.');
-
-  // The JS engine is bundled by Vite from npm, so the previous failing
-  // `cdn.jsdelivr.net/.../+esm` dynamic import is no longer required.
-  const wasmUrls = [
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm',
-    'https://unpkg.com/@mediapipe/tasks-vision@1.0.1/wasm'
-  ];
-  let vision, lastError;
-  for (const wasmUrl of wasmUrls) {
-    try {
-      vision = await FilesetResolver.forVisionTasks(wasmUrl);
-      break;
-    } catch (e) {
-      lastError = e;
-      console.warn('PhotoCall MediaPipe WASM load failed:', wasmUrl, e);
-    }
+  // 0.10.22 was never published as a stable npm/CDN package. Use the current
+  // stable Tasks Vision release so the avatar engine can initialize reliably.
+  const VISION_VERSION = '1.0.1';
+  if (!window._photoCallVisionPromise) {
+    window._photoCallVisionPromise = import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/+esm`);
   }
-  if (!vision) throw new Error(`MediaPipe WASM failed to load. ${lastError?.message || ''}`);
-
-  const modelUrls = [
-    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/face_landmarker.task'
-  ];
-  let lastModelError;
-  for (const modelAssetPath of modelUrls) {
-    try {
-      window._photoCallFaceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath, delegate: 'GPU' },
-        runningMode: 'IMAGE',
-        numFaces: 1,
-        minFaceDetectionConfidence: 0.45,
-        minFacePresenceConfidence: 0.45,
-        minTrackingConfidence: 0.45,
-        outputFaceBlendshapes: true,
-        outputFacialTransformationMatrixes: true
-      });
-      return window._photoCallFaceLandmarker;
-    } catch (e) {
-      lastModelError = e;
-      console.warn('PhotoCall FaceLandmarker model failed:', modelAssetPath, e);
-    }
-  }
-  throw new Error(`Face landmark model could not initialize. ${lastModelError?.message || ''}`);
+  const { FaceLandmarker, FilesetResolver } = await window._photoCallVisionPromise;
+  const vision = await FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/wasm`);
+  window._photoCallFaceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+      delegate: 'GPU'
+    },
+    runningMode: 'IMAGE',
+    numFaces: 1,
+    minFaceDetectionConfidence: 0.5,
+    minFacePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: true
+  });
+  return window._photoCallFaceLandmarker;
 }
 
 function imageToCanvasPoint(lm, image = img) {
@@ -326,13 +306,13 @@ async function validateHumanPhoto(image) {
     faceState = calculateFaceState(landmarks);
     const xs = faceBase.map(p => p.x), ys = faceBase.map(p => p.y);
     faceBox = [Math.min(...xs), Math.min(...ys), Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)];
-    photoValidation.textContent = `Human face detected: ${landmarks.length} landmarks. Avatar deformation engine ready.`;
+    photoValidation.textContent = `Human face detected: ${landmarks.length} landmarks. Live avatar animation ready — eyes, brows, lips, jaw and head movement enabled.`;
     avatarReady = true;
     return true;
   } catch (e) {
     console.error('Face landmark engine:', e);
     avatarReady = false;
-    photoValidation.textContent = `Face animation engine error: ${e.message}`;
+    photoValidation.textContent = `Face animation could not initialize: ${e.message}`;
     return false;
   }
 }
@@ -350,7 +330,7 @@ function loadPhoto() {
 files.onchange = e => {
   const picked = [...e.target.files].filter(f => /^image\/(jpeg|png|webp)$/.test(f.type));
   picked.forEach(file => photos.push({ url: URL.createObjectURL(file), name: file.name, file }));
-  if (picked.length) { selected = photos.length - 1; galleryRender(); loadPhoto(); say(`${picked.length} photo${picked.length === 1 ? '' : 's'} ready. PhotoCall is building the facial landmark mesh now.`); }
+  if (picked.length) { selected = photos.length - 1; galleryRender(); loadPhoto(); say(`${picked.length} photo${picked.length === 1 ? '' : 's'} ready. PhotoCall is turning the face into a live 2D avatar puppet.`); }
 };
 
 $('#flip').onclick = () => { mirrored = !mirrored; if (img) loadPhoto(); else drawAvatar(); };
@@ -376,41 +356,96 @@ function affineForTriangle(s0, s1, s2, t0, t1, t2) {
 
 function animatedFacePoints() {
   if (!faceBase?.length) return null;
+
+  // The uploaded image is the identity layer. The mesh below is the puppet/rig
+  // layer: it moves the actual facial pixels instead of merely moving an overlay.
   const p = faceBase.map(v => ({ x: v.x, y: v.y }));
   const t = avatarTime;
-  const talk = Math.min(1, audioLevel * 1.9);
-  const blink = Math.max(0, Math.sin(t * 0.42 - 0.7)) ** 36;
-  const nod = Math.sin(t * 0.85) * (1.2 + talk * 2.0);
-  const tilt = Math.sin(t * 0.63) * 0.008;
+  const hasMic = !!micStream;
+  const audioTalk = Math.min(1, audioLevel * 2.4);
+
+  // Give the preview a visible idle performance even before the microphone starts.
+  // During a call, microphone energy becomes the primary mouth driver.
+  const previewTalk = 0.5 + 0.5 * Math.sin(t * 4.8) * (0.62 + 0.38 * Math.sin(t * 1.7));
+  const talk = hasMic ? Math.max(audioTalk, audioLevel > 0.012 ? 0.16 : 0) : previewTalk * 0.72;
+
+  // Natural-looking periodic blink: short closure roughly every 4-6 seconds.
+  const blinkWave = Math.max(0, Math.sin(t * 1.45 - 0.9));
+  const blink = Math.pow(blinkWave, 26);
+
+  // Slow head movement. This is deliberately stronger in preview mode so users
+  // can immediately see that the uploaded still image has become an avatar.
+  const yaw = Math.sin(t * 0.72) * (hasMic ? 0.018 : 0.030);
+  const pitch = Math.sin(t * 0.91 + 1.2) * (hasMic ? 2.2 : 3.4);
+  const sway = Math.sin(t * 0.83) * (hasMic ? 1.6 : 2.8);
+
   const faceCx = (p[234]?.x + p[454]?.x) / 2 || canvas.width / 2;
   const faceCy = (p[10]?.y + p[152]?.y) / 2 || canvas.height / 2;
-  const move = (idx, dx, dy) => { if (p[idx]) { p[idx].x += dx; p[idx].y += dy; } };
-  const around = (idx, sx, sy) => {
-    if (!p[idx]) return;
-    const dx = p[idx].x - faceCx, dy = p[idx].y - faceCy;
-    p[idx].x += dx * sx + dy * sy;
-    p[idx].y += dy * sx - dx * sy;
+  const faceW = Math.max(80, Math.abs((p[454]?.x || faceCx) - (p[234]?.x || faceCx)));
+  const faceH = Math.max(100, Math.abs((p[152]?.y || faceCy) - (p[10]?.y || faceCy)));
+
+  const move = (idx, dx, dy) => {
+    if (p[idx]) { p[idx].x += dx; p[idx].y += dy; }
   };
-  // Whole-head micro motion.
+
+  const rotateAndScale = (idx, scaleX = 0, scaleY = 0) => {
+    if (!p[idx]) return;
+    const dx = p[idx].x - faceCx;
+    const dy = p[idx].y - faceCy;
+    const c = Math.cos(yaw), ss = Math.sin(yaw);
+    const rx = dx * c - dy * ss;
+    const ry = dx * ss + dy * c;
+    p[idx].x = faceCx + rx * (1 + scaleX);
+    p[idx].y = faceCy + ry * (1 + scaleY) + pitch;
+  };
+
+  // Head/neck movement affects the entire facial mesh.
   for (let i = 0; i < p.length; i++) {
-    p[i].x += Math.sin(t * 0.9) * 0.8 + Math.sin(t * 1.7 + i * 0.02) * talk * 0.25;
-    p[i].y += nod;
-    around(i, 0.0001, tilt);
+    rotateAndScale(i, 0.006 * Math.sin(t * 0.6), 0.004 * Math.sin(t * 0.7));
+    p[i].x += sway + Math.sin(t * 2.1 + i * 0.018) * 0.22;
   }
-  // Jaw/lips: speech drives a real landmark mesh rather than painting a mouth ellipse.
-  const mouthOpen = Math.min(18, 1.5 + talk * (5 + Math.max(1, faceBase[152]?.y - faceBase[13]?.y) * 0.035));
-  [13,14,12,15,16,17,18,19,20,21].forEach(i => move(i, 0, i === 14 || i === 17 || i === 18 ? mouthOpen : mouthOpen * 0.25));
-  [78,308,95,324].forEach(i => move(i, 0, mouthOpen * 0.55));
-  [152,149,150,176,148].forEach(i => move(i, 0, talk * 2.2));
-  // Eyelid compression gives visible blinking while preserving the original eye texture.
-  const leftEye = [33,133,159,145,160,144,158,153,155,154];
-  const rightEye = [362,263,386,374,387,373,385,380,382,381];
-  leftEye.forEach(i => move(i, 0, (p[i].y - faceCy) * blink * -0.03));
-  rightEye.forEach(i => move(i, 0, (p[i].y - faceCy) * blink * -0.03));
-  [70,63,105,66,107,336,296,334,293,300].forEach(i => move(i, 0, -blink * 0.4));
+
+  // Eye blink: compress the upper/lower eyelid landmarks toward the eye centre.
+  const eyeGroups = [
+    { upper: [159, 160, 161, 158], lower: [145, 144, 153, 154], center: 159 },
+    { upper: [386, 387, 388, 385], lower: [374, 373, 380, 381], center: 386 }
+  ];
+  for (const eye of eyeGroups) {
+    const cy = p[eye.center]?.y ?? faceCy;
+    [...eye.upper, ...eye.lower].forEach(i => {
+      if (!p[i]) return;
+      const direction = p[i].y < cy ? 1 : -1;
+      p[i].y += direction * blink * Math.max(3.5, faceH * 0.018);
+    });
+  }
+
+  // Eyebrows rise/fall independently to make the expression visibly change.
+  const browLift = (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 1.15))) * Math.max(0.25, talk);
+  [70, 63, 105, 66, 107, 336, 296, 334, 293, 300].forEach(i => move(i, 0, -browLift * Math.max(2.5, faceH * 0.012)));
+
+  // Mouth/jaw rig. These are intentionally larger than the old micro-motion so
+  // the user can see the lips and jaw actually opening on the uploaded face.
+  const mouthOpen = Math.max(1.2, faceH * (0.018 + talk * 0.050));
+  const mouthWide = faceW * (0.004 + talk * 0.010);
+  [13, 12, 15, 16].forEach(i => move(i, 0, -mouthOpen * 0.48));
+  [14, 17, 18, 19, 20, 21].forEach(i => move(i, 0, mouthOpen * 0.72));
+  [61, 291, 78, 308, 95, 324].forEach(i => {
+    if (!p[i]) return;
+    const dx = p[i].x - faceCx;
+    p[i].x += Math.sign(dx || 1) * mouthWide;
+  });
+  [152, 149, 150, 176, 148].forEach(i => move(i, 0, talk * Math.max(2, faceH * 0.012)));
+
+  // Subtle cheek movement follows speech, making the lower face feel attached to
+  // the animated mouth instead of leaving the jaw completely rigid.
+  [50, 101, 205, 280, 330, 425].forEach(i => {
+    if (!p[i]) return;
+    const dx = p[i].x - faceCx;
+    move(i, dx * 0.0015 * talk, talk * Math.max(1, faceH * 0.004));
+  });
+
   return p;
 }
-
 function drawDeformedFace() {
   if (!img || !faceBase || !faceTriangles?.length) return;
   const target = animatedFacePoints();
