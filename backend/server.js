@@ -68,7 +68,7 @@ app.get('/health', async (_req, res) => {
   if (process.env.MONGODB_URI) {
     try { await connectMongo(); database = 'connected'; } catch (e) { database = 'error'; }
   }
-  res.json({ ok: database === 'connected', service: 'photocall', database, turn: Boolean(process.env.METERED_DOMAIN && process.env.METERED_TURN_API_KEY), elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY), signaling: 'rest-polling' });
+  res.json({ ok: true, service: 'photocall', database, turn: Boolean(process.env.METERED_DOMAIN && process.env.METERED_TURN_API_KEY), elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY), signaling: database === 'connected' ? 'rest-polling' : 'unavailable-until-database-connects' });
 });
 app.get('/api/config', async (_req, res) => res.json({ appName: 'PhotoCall', iceServers: await getIceServers(), signaling: 'rest-polling', maxPeersPerRoom: 2, frontend: FRONTEND_URL }));
 

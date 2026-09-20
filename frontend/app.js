@@ -18,6 +18,7 @@ let audioCtx, source, filter, compressor, shaper, analyser, destination, micStre
 let voiceRecorder = null, voiceCloneQueueTime = 0, uploadedVoiceReady = false;
 let pc = null, muted = false, voiceMode = 'normal', audioLevel = 0, timerStart = 0, timerHandle = null, outgoingStream = null;
 let animationFrame = 0, avatarTime = 0;
+let faceControlVideo = null, liveLandmarks = null, liveNeutral = null, faceControlActive = false, faceControlBusy = false, faceControlLastVideoTime = -1, faceControlLandmarker = null;
 
 const avatarEnabledEl = $('#avatarEnabled');
 const voiceEnabledEl = $('#voiceEnabled');
@@ -32,6 +33,8 @@ const hint = $('#hint');
 const talking = $('#talking');
 const meterBar = $('#meterBar');
 const photoValidation = $('#photoValidation');
+const roomInput = $('#room');
+roomInput.value = `room-${crypto.randomUUID().slice(0, 8)}`;
 
 function say(text) { $('#msg').textContent = text; }
 function status(text, online = false) {
@@ -53,7 +56,12 @@ async function discoverBackend() {
     for (const path of ['/health', '/']) {
       try {
         const r = await fetchTimeout(`${base}${path}`);
-        if (r.ok) { API = base; return; }
+        if (r.ok) {
+          API = base;
+          const body = await r.json().catch(() => ({}));
+          if (body.database === 'error' || body.database === 'unavailable') console.warn('PhotoCall backend database:', body.database);
+          return;
+        }
         last = new Error(`${base}${path} returned ${r.status}`);
       } catch (e) { last = e; }
     }
@@ -152,7 +160,7 @@ async function boot() {
   status('Connecting…');
   try {
     await discoverBackend();
-    status('Backend online', true);
+    status('Backend API online', true);
   } catch (e) {
     console.error(e);
     status('Backend offline');
@@ -170,7 +178,7 @@ async function boot() {
     say('PhotoCall is ready. Upload a clear human photo — the preview will animate automatically, then microphone audio can drive the mouth during a call.');
   } catch (e) {
     console.warn('Backend session/config unavailable:', e);
-    status('Backend online • session unavailable', true);
+    status('Backend API online • database unavailable', true);
     say('Avatar preview is ready. Backend session services are temporarily unavailable; calling/signaling will require the backend session to recover.');
   }
 }
@@ -191,11 +199,19 @@ function galleryRender() {
 
 async function loadFaceLandmarker() {
   if (window._photoCallFaceLandmarker) return window._photoCallFaceLandmarker;
-  // 0.10.22 was never published as a stable npm/CDN package. Use the current
-  // stable Tasks Vision release so the avatar engine can initialize reliably.
   const VISION_VERSION = '1.0.1';
+  const loaders = [
+    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/+esm`,
+    `https://esm.sh/@mediapipe/tasks-vision@${VISION_VERSION}`
+  ];
   if (!window._photoCallVisionPromise) {
-    window._photoCallVisionPromise = import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/+esm`);
+    window._photoCallVisionPromise = (async () => {
+      let lastError;
+      for (const url of loaders) {
+        try { return await import(url); } catch (e) { lastError = e; }
+      }
+      throw new Error(`MediaPipe Vision could not load. ${lastError?.message || ''}`.trim());
+    })();
   }
   const { FaceLandmarker, FilesetResolver } = await window._photoCallVisionPromise;
   const vision = await FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/wasm`);
@@ -287,6 +303,7 @@ async function validateHumanPhoto(image) {
   faceBox = null; faceLandmarks = null; faceTriangles = null; faceBase = null; faceState = null;
   try {
     const landmarker = await loadFaceLandmarker();
+    await landmarker.setOptions({ runningMode: 'IMAGE' });
     const result = landmarker.detect(image);
     const landmarks = result.faceLandmarks?.[0];
     if (!landmarks || landmarks.length < 400) throw new Error('No complete human face landmark mesh detected.');
@@ -308,6 +325,7 @@ async function validateHumanPhoto(image) {
     faceBox = [Math.min(...xs), Math.min(...ys), Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)];
     photoValidation.textContent = `Human face detected: ${landmarks.length} landmarks. Live avatar animation ready — eyes, brows, lips, jaw and head movement enabled.`;
     avatarReady = true;
+    $('#faceControl').disabled = false;
     return true;
   } catch (e) {
     console.error('Face landmark engine:', e);
@@ -317,14 +335,138 @@ async function validateHumanPhoto(image) {
   }
 }
 
+
+function ensureFaceControlVideo() {
+  if (faceControlVideo) return faceControlVideo;
+  faceControlVideo = document.createElement('video');
+  faceControlVideo.autoplay = true;
+  faceControlVideo.muted = true;
+  faceControlVideo.playsInline = true;
+  faceControlVideo.style.display = 'none';
+  document.body.appendChild(faceControlVideo);
+  return faceControlVideo;
+}
+
+async function startFaceControl() {
+  if (faceControlActive) return true;
+  if (!img || !avatarReady) throw new Error('Upload a valid human photo first.');
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access is not available in this browser.');
+  const video = ensureFaceControlVideo();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  const landmarker = await loadFaceLandmarker();
+  await landmarker.setOptions({ runningMode: 'VIDEO' });
+  faceControlLandmarker = landmarker;
+  faceControlActive = true;
+  faceControlLastVideoTime = -1;
+  liveNeutral = null;
+  $('#faceControlStatus').textContent = 'Face control active — move your head, eyes and mouth.';
+  $('#faceControlStatus').className = 'message online-message';
+  $('#faceControl').textContent = '⏹ Stop face control';
+  requestFaceTracking();
+  return true;
+}
+
+function stopFaceControl() {
+  faceControlActive = false;
+  faceControlBusy = false;
+  liveLandmarks = null;
+  liveNeutral = null;
+  if (faceControlVideo?.srcObject) faceControlVideo.srcObject.getTracks().forEach(t => t.stop());
+  if (faceControlVideo) faceControlVideo.srcObject = null;
+  $('#faceControl').textContent = '🎥 Start face control';
+  $('#faceControlStatus').textContent = 'Face control is off.';
+  $('#faceControlStatus').className = 'message';
+}
+
+function requestFaceTracking() {
+  if (!faceControlActive || !faceControlVideo) return;
+  const video = faceControlVideo;
+  const tick = async () => {
+    if (!faceControlActive) return;
+    if (!faceControlBusy && video.readyState >= 2 && video.currentTime !== faceControlLastVideoTime) {
+      faceControlBusy = true;
+      faceControlLastVideoTime = video.currentTime;
+      try {
+        const result = faceControlLandmarker.detectForVideo(video, performance.now());
+        const lm = result.faceLandmarks?.[0];
+        if (lm?.length >= 400) {
+          if (!liveNeutral) liveNeutral = lm.map(p => ({ x: p.x, y: p.y, z: p.z || 0 }));
+          liveLandmarks = lm;
+          $('#faceControlStatus').textContent = 'Face control active — eyes, eyebrows, lips, jaw and head are tracking.';
+        } else {
+          liveLandmarks = null;
+          $('#faceControlStatus').textContent = 'Face control active — move closer and face the camera.';
+        }
+      } catch (e) {
+        console.warn('Face tracking:', e);
+      } finally { faceControlBusy = false; }
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+function liveControlledFacePoints() {
+  if (!faceBase?.length || !liveLandmarks?.length || !liveNeutral?.length) return null;
+  const p = faceBase.map(v => ({ x: v.x, y: v.y }));
+  const get = (arr, i) => arr[i] || arr[0];
+  const live = get(liveLandmarks, 0), neutral = get(liveNeutral, 0);
+  const center = (arr) => ({
+    x: (get(arr, 234).x + get(arr, 454).x) / 2,
+    y: (get(arr, 10).y + get(arr, 152).y) / 2
+  });
+  const lc = center(liveLandmarks), nc = center(liveNeutral);
+  const liveW = Math.max(0.08, Math.abs(get(liveLandmarks,454).x - get(liveLandmarks,234).x));
+  const neutralW = Math.max(0.08, Math.abs(get(liveNeutral,454).x - get(liveNeutral,234).x));
+  const scale = Math.min(1.8, Math.max(0.55, neutralW / liveW));
+  const baseW = Math.max(100, Math.abs(faceBase[454].x - faceBase[234].x));
+  const baseH = Math.max(120, Math.abs(faceBase[152].y - faceBase[10].y));
+  const dxHead = (lc.x - nc.x) * baseW * 1.35;
+  const dyHead = (lc.y - nc.y) * baseH * 1.35;
+
+  // Direct landmark displacement makes the uploaded face follow the user's
+  // expression instead of using synthetic sine-wave movement.
+  for (let i = 0; i < p.length; i++) {
+    const d = liveLandmarks[i], n = liveNeutral[i];
+    if (!d || !n) continue;
+    const dx = (d.x - n.x) * baseW * 1.45;
+    const dy = (d.y - n.y) * baseH * 1.45;
+    p[i].x += dx;
+    p[i].y += dy;
+  }
+
+  // Stable head translation and mild yaw/scale preserve the full portrait.
+  for (let i = 0; i < p.length; i++) {
+    const q = p[i];
+    q.x += dxHead;
+    q.y += dyHead;
+    const bx = q.x - faceBase[234].x;
+    q.x = faceBase[234].x + bx * scale;
+  }
+  return p;
+}
+
 function loadPhoto() {
+  stopFaceControl();
+  liveLandmarks = null; liveNeutral = null;
   if (!photos.length) {
     img = null; faceBox = null; faceLandmarks = null; faceTriangles = null; faceBase = null; avatarReady = false;
     hint.classList.remove('hidden'); $('#photoInfo').textContent = 'No photo selected';
     photoValidation.textContent = 'Photo check: waiting for an image.'; return;
   }
   hint.classList.add('hidden'); $('#photoInfo').textContent = `${selected + 1} / ${photos.length} selected`;
-  img = new Image(); img.onload = async () => { await validateHumanPhoto(img); drawAvatar(); }; img.src = photos[selected].url;
+  img = new Image(); img.onload = async () => {
+    const valid = await validateHumanPhoto(img);
+    drawAvatar();
+    if (valid) {
+      try { await startFaceControl(); } catch (e) { $('#faceControlStatus').textContent = `Camera control is waiting: ${e.message}`; }
+    }
+  }; img.src = photos[selected].url;
 }
 
 files.onchange = e => {
@@ -356,96 +498,27 @@ function affineForTriangle(s0, s1, s2, t0, t1, t2) {
 
 function animatedFacePoints() {
   if (!faceBase?.length) return null;
+  if (liveLandmarks && liveNeutral) return liveControlledFacePoints();
 
-  // The uploaded image is the identity layer. The mesh below is the puppet/rig
-  // layer: it moves the actual facial pixels instead of merely moving an overlay.
+  // No camera control yet: keep a very small idle animation so the preview is
+  // clearly an avatar, but never pretend this is user face tracking.
   const p = faceBase.map(v => ({ x: v.x, y: v.y }));
   const t = avatarTime;
-  const hasMic = !!micStream;
-  const audioTalk = Math.min(1, audioLevel * 2.4);
-
-  // Give the preview a visible idle performance even before the microphone starts.
-  // During a call, microphone energy becomes the primary mouth driver.
-  const previewTalk = 0.5 + 0.5 * Math.sin(t * 4.8) * (0.62 + 0.38 * Math.sin(t * 1.7));
-  const talk = hasMic ? Math.max(audioTalk, audioLevel > 0.012 ? 0.16 : 0) : previewTalk * 0.72;
-
-  // Natural-looking periodic blink: short closure roughly every 4-6 seconds.
-  const blinkWave = Math.max(0, Math.sin(t * 1.45 - 0.9));
-  const blink = Math.pow(blinkWave, 26);
-
-  // Slow head movement. This is deliberately stronger in preview mode so users
-  // can immediately see that the uploaded still image has become an avatar.
-  const yaw = Math.sin(t * 0.72) * (hasMic ? 0.018 : 0.030);
-  const pitch = Math.sin(t * 0.91 + 1.2) * (hasMic ? 2.2 : 3.4);
-  const sway = Math.sin(t * 0.83) * (hasMic ? 1.6 : 2.8);
-
+  const talk = Math.min(1, audioLevel * 2.0);
+  const blink = Math.pow(Math.max(0, Math.sin(t * 1.1 - 1.2)), 30);
   const faceCx = (p[234]?.x + p[454]?.x) / 2 || canvas.width / 2;
   const faceCy = (p[10]?.y + p[152]?.y) / 2 || canvas.height / 2;
-  const faceW = Math.max(80, Math.abs((p[454]?.x || faceCx) - (p[234]?.x || faceCx)));
   const faceH = Math.max(100, Math.abs((p[152]?.y || faceCy) - (p[10]?.y || faceCy)));
-
-  const move = (idx, dx, dy) => {
-    if (p[idx]) { p[idx].x += dx; p[idx].y += dy; }
-  };
-
-  const rotateAndScale = (idx, scaleX = 0, scaleY = 0) => {
-    if (!p[idx]) return;
-    const dx = p[idx].x - faceCx;
-    const dy = p[idx].y - faceCy;
-    const c = Math.cos(yaw), ss = Math.sin(yaw);
-    const rx = dx * c - dy * ss;
-    const ry = dx * ss + dy * c;
-    p[idx].x = faceCx + rx * (1 + scaleX);
-    p[idx].y = faceCy + ry * (1 + scaleY) + pitch;
-  };
-
-  // Head/neck movement affects the entire facial mesh.
-  for (let i = 0; i < p.length; i++) {
-    rotateAndScale(i, 0.006 * Math.sin(t * 0.6), 0.004 * Math.sin(t * 0.7));
-    p[i].x += sway + Math.sin(t * 2.1 + i * 0.018) * 0.22;
-  }
-
-  // Eye blink: compress the upper/lower eyelid landmarks toward the eye centre.
-  const eyeGroups = [
-    { upper: [159, 160, 161, 158], lower: [145, 144, 153, 154], center: 159 },
-    { upper: [386, 387, 388, 385], lower: [374, 373, 380, 381], center: 386 }
-  ];
-  for (const eye of eyeGroups) {
-    const cy = p[eye.center]?.y ?? faceCy;
-    [...eye.upper, ...eye.lower].forEach(i => {
-      if (!p[i]) return;
-      const direction = p[i].y < cy ? 1 : -1;
-      p[i].y += direction * blink * Math.max(3.5, faceH * 0.018);
-    });
-  }
-
-  // Eyebrows rise/fall independently to make the expression visibly change.
-  const browLift = (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 1.15))) * Math.max(0.25, talk);
-  [70, 63, 105, 66, 107, 336, 296, 334, 293, 300].forEach(i => move(i, 0, -browLift * Math.max(2.5, faceH * 0.012)));
-
-  // Mouth/jaw rig. These are intentionally larger than the old micro-motion so
-  // the user can see the lips and jaw actually opening on the uploaded face.
-  const mouthOpen = Math.max(1.2, faceH * (0.018 + talk * 0.050));
-  const mouthWide = faceW * (0.004 + talk * 0.010);
-  [13, 12, 15, 16].forEach(i => move(i, 0, -mouthOpen * 0.48));
-  [14, 17, 18, 19, 20, 21].forEach(i => move(i, 0, mouthOpen * 0.72));
-  [61, 291, 78, 308, 95, 324].forEach(i => {
-    if (!p[i]) return;
-    const dx = p[i].x - faceCx;
-    p[i].x += Math.sign(dx || 1) * mouthWide;
-  });
-  [152, 149, 150, 176, 148].forEach(i => move(i, 0, talk * Math.max(2, faceH * 0.012)));
-
-  // Subtle cheek movement follows speech, making the lower face feel attached to
-  // the animated mouth instead of leaving the jaw completely rigid.
-  [50, 101, 205, 280, 330, 425].forEach(i => {
-    if (!p[i]) return;
-    const dx = p[i].x - faceCx;
-    move(i, dx * 0.0015 * talk, talk * Math.max(1, faceH * 0.004));
-  });
-
+  const move = (i, dx, dy) => { if (p[i]) { p[i].x += dx; p[i].y += dy; } };
+  [159,160,161,158,145,144,153,154,386,387,388,385,374,373,380,381].forEach(i => move(i, 0, blink * Math.max(2, faceH * 0.012)));
+  [70,63,105,66,107,336,296,334,293,300].forEach(i => move(i, 0, -Math.max(0, Math.sin(t * 1.2)) * 2.0));
+  const mouth = faceH * (0.006 + talk * 0.045);
+  [13,12,15,16].forEach(i => move(i, 0, -mouth * 0.45));
+  [14,17,18,19,20,21].forEach(i => move(i, 0, mouth * 0.65));
+  [152,149,150,176,148].forEach(i => move(i, 0, talk * faceH * 0.006));
   return p;
 }
+
 function drawDeformedFace() {
   if (!img || !faceBase || !faceTriangles?.length) return;
   const target = animatedFacePoints();
@@ -471,8 +544,7 @@ function drawDeformedFace() {
 
 function drawAvatar() {
   ctx.fillStyle = '#070b15'; ctx.fillRect(0, 0, canvas.width, canvas.height); if (!img) return;
-  const t = avatarTime, talk = Math.min(1, audioLevel * 1.9);
-  drawCover(img, Math.sin(t * 1.05) * (1 + talk * 1.5), Math.sin(t * .72) * (1 + talk), 1 + Math.sin(t * .55) * .002);
+  drawCover(img, 0, 0, 1);
   if (avatarReady) drawDeformedFace();
   if (!avatarReady) { ctx.fillStyle = 'rgba(120,80,160,.25)'; ctx.fillRect(0,0,canvas.width,canvas.height); }
 }
@@ -533,6 +605,11 @@ async function startVoiceClonePipeline() {
 }
 function stopVoiceClonePipeline() { try { voiceRecorder?.stop(); } catch {} voiceRecorder = null; voiceCloneQueueTime = 0; }
 
+$('#faceControl').onclick = async () => {
+  try { if (faceControlActive) stopFaceControl(); else await startFaceControl(); }
+  catch (e) { $('#faceControlStatus').textContent = `Face control error: ${e.message}`; say(e.message); }
+};
+
 voiceFileEl.onchange = async () => {
   const f = voiceFileEl.files?.[0]; if (!f) return;
   if (f.size > 12 * 1024 * 1024) return voiceStatusEl.textContent = 'Voice sample must be 12MB or smaller.';
@@ -558,7 +635,7 @@ async function startMic() {
   if (micStream) return;
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
   await setupAudio();
-  $('#mic').textContent = '⏹ Stop microphone'; $('#mute').disabled = false; say('Microphone ready. Your uploaded photo is now a live animated avatar.');
+  $('#mic').textContent = '⏹ Stop microphone'; $('#mute').disabled = false; say('Microphone ready. Your avatar will speak when you speak; face control drives the facial movement.');
 }
 
 $('#mic').onclick = async () => {
@@ -573,6 +650,40 @@ $('#mic').onclick = async () => {
 
 $('#mute').onclick = () => { if (!micStream) return; muted = !muted; micStream.getAudioTracks().forEach(t => t.enabled = !muted); $('#mute').textContent = muted ? '🎙 Unmute' : '🔇 Mute'; };
 
+
+async function testVoice() {
+  if (!micStream) await startMic();
+  const statusEl = voiceStatusEl;
+  statusEl.textContent = 'Recording a short voice test…';
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+  const recorder = new MediaRecorder(micStream, { mimeType: mime });
+  const chunks = [];
+  recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+  const done = new Promise((resolve, reject) => { recorder.onstop = resolve; recorder.onerror = () => reject(new Error('Voice recorder failed.')); });
+  recorder.start();
+  setTimeout(() => { try { recorder.stop(); } catch {} }, 2200);
+  await done;
+  const blob = new Blob(chunks, { type: mime });
+  try {
+    if (voiceEnabledEl.checked && uploadedVoiceReady) {
+      const form = new FormData(); form.append('file', blob, 'voice-test.webm');
+      const r = await fetch(API + '/api/voice/convert', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || 'Voice conversion failed.');
+      const audio = new Audio(URL.createObjectURL(await r.blob()));
+      await audio.play();
+    } else {
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      await audio.play();
+      audio.onended = () => URL.revokeObjectURL(url);
+    }
+    statusEl.textContent = 'Voice test played successfully. You can start the call.';
+  } catch (e) {
+    statusEl.textContent = `Voice test failed: ${e.message}`;
+  }
+}
+$('#testVoice').onclick = async () => { try { await testVoice(); } catch (e) { say(`Voice test error: ${e.message}`); } };
+
 function makePeer() {
   pc = new RTCPeerConnection({ iceServers });
   pc.onicecandidate = e => e.candidate && sendSignal('ice-candidate', { candidate: e.candidate });
@@ -583,6 +694,7 @@ function makePeer() {
 
 async function outgoing() {
   if (avatarEnabledEl.checked && !img) throw new Error('Upload a human photo first.');
+  if (avatarEnabledEl.checked && !faceControlActive) await startFaceControl();
   if (!micStream) await startMic();
   const videoStream = avatarEnabledEl.checked ? canvas.captureStream(30) : new MediaStream();
   const audioTracks = processedStream?.getAudioTracks() || [];
@@ -623,7 +735,7 @@ $('#shareSignal').onclick = () => $('#connectSignal').click();
 
 function startTimer() { timerStart = Date.now(); clearInterval(timerHandle); timerHandle = setInterval(() => { const s = Math.floor((Date.now() - timerStart) / 1000); $('#callTimer').textContent = `${String(Math.floor(s / 60)).padStart(2,'0')}:${String(s % 60).padStart(2,'0')}`; }, 500); }
 function stopTimer() { clearInterval(timerHandle); timerHandle = null; $('#callTimer').textContent = '00:00'; }
-async function cleanup(emit = true) { if (emit && roomJoined) { try { await sendSignal('call-ended'); } catch {} } clearInterval(pollTimer); pollTimer = null; roomJoined = false; pc?.close(); pc = null; outgoingStream?.getTracks().forEach(t => t.stop()); outgoingStream = null; remote.srcObject = null; $('#call').disabled = false; $('#hang').disabled = true; $('#room').disabled = false; $('#remoteState').textContent = 'Waiting for connection…'; stopTimer(); }
+async function cleanup(emit = true) { stopFaceControl(); if (emit && roomJoined) { try { await sendSignal('call-ended'); } catch {} } clearInterval(pollTimer); pollTimer = null; roomJoined = false; pc?.close(); pc = null; outgoingStream?.getTracks().forEach(t => t.stop()); outgoingStream = null; remote.srcObject = null; $('#call').disabled = false; $('#hang').disabled = true; $('#room').disabled = false; $('#remoteState').textContent = 'Waiting for connection…'; stopTimer(); }
 $('#hang').onclick = () => cleanup(true);
 $('#copyRoom').onclick = async () => { try { await navigator.clipboard.writeText($('#room').value.trim()); say('Room code copied.'); } catch { say('Copy failed.'); } };
 

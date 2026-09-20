@@ -1,37 +1,32 @@
-# PhotoCall production deployment
+# PhotoCall Vercel Deployment
 
-## Backend Vercel project
+PhotoCall is intentionally split into two Vercel deployments:
 
-Deploy the repository root as the backend project. The Vercel entrypoint is `server.js`, which exports the Express app directly.
+- Frontend project root: `frontend/`
+- Backend project root: `backend/`
 
-Set these environment variables in Vercel:
+## Frontend environment
 
-- `CLIENT_URL=https://photocall-frontend.vercel.app`
-- `CORS_ORIGIN=https://photocall-frontend.vercel.app`
-- `PUBLIC_API_URL=https://photocall-backend.vercel.app`
-- `MONGODB_URI=<your MongoDB URI>`
-- `TURN_URL=<your Metered TURN URL>`
-- `TURN_USERNAME=<your Metered username>`
-- `TURN_CREDENTIAL=<your Metered credential>`
-- `METERED_DOMAIN=https://photocallapp.metered.live`
-- `METERED_TURN_API_KEY=<your Metered API key>`
-- `ELEVENLABS_API_KEY=<your ElevenLabs API key>`
-- `ELEVENLABS_STS_MODEL=eleven_multilingual_sts_v2`
+Set these in the frontend Vercel project:
 
-`JWT_SECRET` may remain configured for compatibility, but direct-access mode does not require login/JWT.
+- `VITE_API_URL=https://photocall-backend.vercel.app`
+- `VITE_PRODUCTION_API_URL=https://photocall-backend.vercel.app`
+- `VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app`
 
-## Frontend Vercel project
+## Backend environment
 
-Set the root directory to `frontend` and set:
+Set these in the backend Vercel project:
 
-`VITE_API_URL=https://photocall-backend.vercel.app`
+- `MONGODB_URI`
+- `JWT_SECRET`
+- `CLIENT_URL`
+- `CORS_ORIGIN`
+- `PUBLIC_API_URL`
+- TURN credentials (`METERED_DOMAIN` + `METERED_TURN_API_KEY`, or TURN_URL/username/credential)
+- Optional ElevenLabs credentials for uploaded-voice conversion
 
-`VITE_PRODUCTION_API_URL=https://photocall-backend.vercel.app`
+Do not put production secrets in `.env.sample` or in the frontend bundle.
 
-`VITE_PRODUCTION_FRONTEND_URL=https://photocall-frontend.vercel.app`
+## Health check
 
-## Verification
-
-Open the backend URL first. It should return JSON from `/`, and `/health` should report `database: connected` when MongoDB is configured correctly.
-
-The calling path uses REST polling + MongoDB for signaling rather than a process-local Socket.IO room. This avoids relying on a long-lived Node process or in-memory room state in Vercel serverless deployments.
+Open `/health` on the backend deployment. `database: "connected"` is required for room signaling. If the database is unavailable, PhotoCall keeps the avatar engine available but calls/signaling are intentionally reported as unavailable instead of showing a fake successful connection.
