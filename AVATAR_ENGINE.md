@@ -39,3 +39,11 @@ This is a real-time 2D photo-puppet system, not a generative photorealistic vide
 ## Calling
 
 The generated canvas is captured as a WebRTC video track. REST polling is used only for signaling. Production calls require a working MongoDB connection for signaling persistence and a TURN service for restrictive networks.
+
+## Current avatar-control architecture
+
+The browser uses MediaPipe Face Landmarker to track the user's live face. The uploaded portrait is retained as the visual identity while a reduced facial mesh is warped from the target photo's neutral landmarks toward the user's live landmarks. Rendering is throttled to 30 FPS and the source image is cropped to the face region for performance. Blendshape scores are used as additional signals for jaw opening and blinking. The mouth is rendered with an expression overlay when the user's jaw opens so a closed-mouth source image can visibly open during speech.
+
+The camera preview is shown while face control is active so the user can confirm that the webcam is actually driving the avatar.
+
+This is a real-time 2D photo-puppet system, not a generative talking-head model. A single photograph cannot reveal unseen teeth, tongue, hair, or back-of-head information; a production system that needs photorealistic novel views would require a dedicated generative/3D avatar model.

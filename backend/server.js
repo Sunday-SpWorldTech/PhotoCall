@@ -7,10 +7,23 @@ require('dotenv').config();
 
 const PORT = Number(process.env.PORT || 3000);
 const FRONTEND_URL = process.env.CLIENT_URL || 'https://photocall-frontend.vercel.app';
+const ALLOWED_ORIGINS = new Set([FRONTEND_URL, process.env.CORS_ORIGIN, 'https://photocall-frontend.vercel.app'].filter(Boolean).map(v => String(v).replace(/\/$/, '')));
+const VERCEL_FRONTEND_ORIGIN = /^https:\/\/(photo-call|photocall)-frontend(?:-[a-z0-9-]+)?\.vercel\.app$/i;
 const app = express();
 
 app.set('trust proxy', 1);
-app.use(cors({ origin: true, credentials: false, methods: ['GET','POST','DELETE','OPTIONS'] }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    const normalized = String(origin).replace(/\/$/, '');
+    if (ALLOWED_ORIGINS.has(normalized) || VERCEL_FRONTEND_ORIGIN.test(normalized)) return callback(null, true);
+    return callback(new Error('Origin not allowed by PhotoCall backend CORS policy.'));
+  },
+  credentials: false,
+  methods: ['GET','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','X-Guest-Id'],
+  maxAge: 86400
+}));
 app.use(express.json({ limit: '2mb' }));
 
 let mongoPromise = null;
@@ -97,8 +110,10 @@ app.post('/api/rooms/join', async (req, res) => {
 app.get('/api/rooms/:room/events', async (req, res) => {
   try {
     await connectMongo();
-    const room = cleanRoom(req.params.room), guestId = guestFrom(req), after = Number(req.query.after || 0);
-    const docs = await SignalEvent.find({ room, sender: { $ne: guestId }, _id: { $gt: after || '000000000000000000000000' } }).sort({ _id: 1 }).limit(50).lean();
+    const room = cleanRoom(req.params.room), guestId = guestFrom(req);
+    const after = String(req.query.after || '000000000000000000000000');
+    const cursor = /^[0-9a-fA-F]{24}$/.test(after) ? new mongoose.Types.ObjectId(after) : new mongoose.Types.ObjectId('000000000000000000000000');
+    const docs = await SignalEvent.find({ room, sender: { $ne: guestId }, _id: { $gt: cursor } }).sort({ _id: 1 }).limit(50).lean();
     res.json({ events: docs.map(d => ({ id: String(d._id), type: d.type, payload: d.payload })) });
   } catch (e) { res.status(503).json({ message: `Signaling unavailable: ${e.message}` }); }
 });

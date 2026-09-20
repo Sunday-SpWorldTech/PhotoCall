@@ -17,8 +17,10 @@ let faceBox = null, faceLandmarks = null, faceBase = null, faceTriangles = null,
 let audioCtx, source, filter, compressor, shaper, analyser, destination, micStream, processedStream;
 let voiceRecorder = null, voiceCloneQueueTime = 0, uploadedVoiceReady = false;
 let pc = null, muted = false, voiceMode = 'normal', audioLevel = 0, timerStart = 0, timerHandle = null, outgoingStream = null;
-let animationFrame = 0, avatarTime = 0;
-let faceControlVideo = null, liveLandmarks = null, liveNeutral = null, faceControlActive = false, faceControlBusy = false, faceControlLastVideoTime = -1, faceControlLandmarker = null;
+let animationFrame = 0, avatarTime = 0, lastRenderAt = 0;
+const AVATAR_FPS = 30;
+let mouthOpenSmooth = 0, blinkSmoothL = 0, blinkSmoothR = 0, headYawSmooth = 0, headPitchSmooth = 0, headRollSmooth = 0;
+let faceControlVideo = null, liveLandmarks = null, liveNeutral = null, liveBlendshapes = null, faceControlActive = false, faceControlBusy = false, faceControlLastVideoTime = -1, faceControlLandmarker = null, faceControlLastDetectAt = 0;
 
 const avatarEnabledEl = $('#avatarEnabled');
 const voiceEnabledEl = $('#voiceEnabled');
@@ -175,7 +177,7 @@ async function boot() {
     await startGuestSession();
     await loadConfig();
     status('Ready', true);
-    say('PhotoCall is ready. Upload a clear human photo — the preview will animate automatically, then microphone audio can drive the mouth during a call.');
+    say('PhotoCall is ready. Upload a clear human photo, start face control, then move your face to control the avatar.');
   } catch (e) {
     console.warn('Backend session/config unavailable:', e);
     status('Backend API online • database unavailable', true);
@@ -342,7 +344,16 @@ function ensureFaceControlVideo() {
   faceControlVideo.autoplay = true;
   faceControlVideo.muted = true;
   faceControlVideo.playsInline = true;
+  faceControlVideo.style.position = 'fixed';
+  faceControlVideo.style.right = '18px';
+  faceControlVideo.style.bottom = '18px';
+  faceControlVideo.style.width = '180px';
+  faceControlVideo.style.height = '135px';
+  faceControlVideo.style.objectFit = 'cover';
+  faceControlVideo.style.borderRadius = '14px';
+  faceControlVideo.style.zIndex = '50';
   faceControlVideo.style.display = 'none';
+  faceControlVideo.setAttribute('aria-label', 'Face control camera preview');
   document.body.appendChild(faceControlVideo);
   return faceControlVideo;
 }
@@ -362,8 +373,10 @@ async function startFaceControl() {
   await landmarker.setOptions({ runningMode: 'VIDEO' });
   faceControlLandmarker = landmarker;
   faceControlActive = true;
+  faceControlVideo.style.display = 'block';
   faceControlLastVideoTime = -1;
   liveNeutral = null;
+  liveBlendshapes = null;
   $('#faceControlStatus').textContent = 'Face control active — move your head, eyes and mouth.';
   $('#faceControlStatus').className = 'message online-message';
   $('#faceControl').textContent = '⏹ Stop face control';
@@ -376,8 +389,9 @@ function stopFaceControl() {
   faceControlBusy = false;
   liveLandmarks = null;
   liveNeutral = null;
+  liveBlendshapes = null;
   if (faceControlVideo?.srcObject) faceControlVideo.srcObject.getTracks().forEach(t => t.stop());
-  if (faceControlVideo) faceControlVideo.srcObject = null;
+  if (faceControlVideo) { faceControlVideo.srcObject = null; faceControlVideo.style.display = 'none'; }
   $('#faceControl').textContent = '🎥 Start face control';
   $('#faceControlStatus').textContent = 'Face control is off.';
   $('#faceControlStatus').className = 'message';
@@ -386,18 +400,22 @@ function stopFaceControl() {
 function requestFaceTracking() {
   if (!faceControlActive || !faceControlVideo) return;
   const video = faceControlVideo;
-  const tick = async () => {
+  const tick = async (now = performance.now()) => {
     if (!faceControlActive) return;
-    if (!faceControlBusy && video.readyState >= 2 && video.currentTime !== faceControlLastVideoTime) {
+    // MediaPipe inference is deliberately throttled to keep the render loop responsive.
+    if (!faceControlBusy && video.readyState >= 2 && video.currentTime !== faceControlLastVideoTime && now - faceControlLastDetectAt >= 33) {
       faceControlBusy = true;
       faceControlLastVideoTime = video.currentTime;
+      faceControlLastDetectAt = now;
       try {
-        const result = faceControlLandmarker.detectForVideo(video, performance.now());
+        const result = faceControlLandmarker.detectForVideo(video, now);
         const lm = result.faceLandmarks?.[0];
         if (lm?.length >= 400) {
           if (!liveNeutral) liveNeutral = lm.map(p => ({ x: p.x, y: p.y, z: p.z || 0 }));
           liveLandmarks = lm;
-          $('#faceControlStatus').textContent = 'Face control active — eyes, eyebrows, lips, jaw and head are tracking.';
+          liveBlendshapes = result.faceBlendshapes?.[0]?.categories || null;
+          updateExpressionState(lm, liveBlendshapes);
+          $('#faceControlStatus').textContent = 'Face control active — your eyes, eyebrows, lips, jaw and head are controlling the avatar.';
         } else {
           liveLandmarks = null;
           $('#faceControlStatus').textContent = 'Face control active — move closer and face the camera.';
@@ -411,49 +429,80 @@ function requestFaceTracking() {
   requestAnimationFrame(tick);
 }
 
+function blend(name, fallback = 0) {
+  const item = liveBlendshapes?.find(x => x.categoryName === name);
+  return item ? Number(item.score || 0) : fallback;
+}
+
+function updateExpressionState(lm, blendshapes = null) {
+  const d = (a,b) => Math.hypot((lm[a]?.x||0)-(lm[b]?.x||0), (lm[a]?.y||0)-(lm[b]?.y||0));
+  const mouthW = Math.max(.001, d(61,291));
+  const mouthH = d(13,14);
+  const leftEyeW = Math.max(.001, d(33,133));
+  const rightEyeW = Math.max(.001, d(362,263));
+  const leftOpen = d(159,145) / leftEyeW;
+  const rightOpen = d(386,374) / rightEyeW;
+  const blendMouth = blend('jawOpen', 0);
+  const blendBlinkL = blend('eyeBlinkLeft', 0);
+  const blendBlinkR = blend('eyeBlinkRight', 0);
+  mouthOpenSmooth += ((Math.max(mouthH / mouthW, blendMouth * .55) - mouthOpenSmooth) * .32);
+  blinkSmoothL += (Math.max(leftOpen, (1 - blendBlinkL) * .08) - blinkSmoothL) * .35;
+  blinkSmoothR += (Math.max(rightOpen, (1 - blendBlinkR) * .08) - blinkSmoothR) * .35;
+  const leftEye = lm[33], rightEye = lm[263], nose = lm[1];
+  if (leftEye && rightEye && nose) {
+    const midX = (leftEye.x + rightEye.x) / 2;
+    const midY = (leftEye.y + rightEye.y) / 2;
+    headYawSmooth += (((nose.x - midX) / Math.max(.001, Math.abs(rightEye.x-leftEye.x))) - headYawSmooth) * .25;
+    headPitchSmooth += (((nose.y - midY) / Math.max(.001, Math.abs(rightEye.x-leftEye.x))) - headPitchSmooth) * .25;
+    headRollSmooth += ((Math.atan2(rightEye.y-leftEye.y, rightEye.x-leftEye.x)) - headRollSmooth) * .25;
+  }
+}
+
 function liveControlledFacePoints() {
   if (!faceBase?.length || !liveLandmarks?.length || !liveNeutral?.length) return null;
   const p = faceBase.map(v => ({ x: v.x, y: v.y }));
   const get = (arr, i) => arr[i] || arr[0];
-  const live = get(liveLandmarks, 0), neutral = get(liveNeutral, 0);
-  const center = (arr) => ({
-    x: (get(arr, 234).x + get(arr, 454).x) / 2,
-    y: (get(arr, 10).y + get(arr, 152).y) / 2
-  });
-  const lc = center(liveLandmarks), nc = center(liveNeutral);
-  const liveW = Math.max(0.08, Math.abs(get(liveLandmarks,454).x - get(liveLandmarks,234).x));
-  const neutralW = Math.max(0.08, Math.abs(get(liveNeutral,454).x - get(liveNeutral,234).x));
-  const scale = Math.min(1.8, Math.max(0.55, neutralW / liveW));
-  const baseW = Math.max(100, Math.abs(faceBase[454].x - faceBase[234].x));
-  const baseH = Math.max(120, Math.abs(faceBase[152].y - faceBase[10].y));
-  const dxHead = (lc.x - nc.x) * baseW * 1.35;
-  const dyHead = (lc.y - nc.y) * baseH * 1.35;
+  const baseLeft = get(faceBase, 234), baseRight = get(faceBase, 454);
+  const baseTop = get(faceBase, 10), baseBottom = get(faceBase, 152);
+  const baseW = Math.max(100, Math.abs(baseRight.x - baseLeft.x));
+  const baseH = Math.max(120, Math.abs(baseBottom.y - baseTop.y));
+  const liveW = Math.max(.08, Math.abs(get(liveLandmarks,454).x - get(liveLandmarks,234).x));
+  const neutralW = Math.max(.08, Math.abs(get(liveNeutral,454).x - get(liveNeutral,234).x));
+  const scale = Math.min(1.16, Math.max(.86, neutralW / liveW));
+  const lc = { x:(get(liveLandmarks,234).x+get(liveLandmarks,454).x)/2, y:(get(liveLandmarks,10).y+get(liveLandmarks,152).y)/2 };
+  const nc = { x:(get(liveNeutral,234).x+get(liveNeutral,454).x)/2, y:(get(liveNeutral,10).y+get(liveNeutral,152).y)/2 };
+  const dxHead = (lc.x-nc.x) * baseW * 1.9;
+  const dyHead = (lc.y-nc.y) * baseH * 1.9;
 
-  // Direct landmark displacement makes the uploaded face follow the user's
-  // expression instead of using synthetic sine-wave movement.
-  for (let i = 0; i < p.length; i++) {
-    const d = liveLandmarks[i], n = liveNeutral[i];
+  for (let i=0;i<p.length;i++) {
+    const d=liveLandmarks[i], n=liveNeutral[i];
     if (!d || !n) continue;
-    const dx = (d.x - n.x) * baseW * 1.45;
-    const dy = (d.y - n.y) * baseH * 1.45;
-    p[i].x += dx;
-    p[i].y += dy;
+    // Expression displacement: preserve the target photo proportions while transferring
+    // the user's local expression changes onto the photo.
+    p[i].x += (d.x-n.x) * baseW * 2.15;
+    p[i].y += (d.y-n.y) * baseH * 2.15;
   }
 
-  // Stable head translation and mild yaw/scale preserve the full portrait.
-  for (let i = 0; i < p.length; i++) {
-    const q = p[i];
-    q.x += dxHead;
-    q.y += dyHead;
-    const bx = q.x - faceBase[234].x;
-    q.x = faceBase[234].x + bx * scale;
+  // Global head pose: translation + scale + rotation around the photo's face center.
+  const yaw = Math.max(-.22, Math.min(.22, headYawSmooth)) * 1.35;
+  const pitch = Math.max(-.18, Math.min(.18, headPitchSmooth-.32)) * 1.0;
+  const roll = Math.max(-.35, Math.min(.35, headRollSmooth)) * .65;
+  const cx = (baseLeft.x+baseRight.x)/2, cy = (baseTop.y+baseBottom.y)/2;
+  const cos=Math.cos(roll), sin=Math.sin(roll);
+  for (let i=0;i<p.length;i++) {
+    let x=cx+(p[i].x-cx)*scale, y=cy+(p[i].y-cy)*scale;
+    x += dxHead + yaw*baseW*(.22 - Math.abs((faceBase[i]?.y||cy)-cy)/baseH*.08);
+    y += dyHead + pitch*baseH*.18;
+    const rx=x-cx, ry=y-cy;
+    p[i].x=cx+rx*cos-ry*sin;
+    p[i].y=cy+rx*sin+ry*cos;
   }
   return p;
 }
 
 function loadPhoto() {
   stopFaceControl();
-  liveLandmarks = null; liveNeutral = null;
+  liveLandmarks = null; liveNeutral = null; liveBlendshapes = null;
   if (!photos.length) {
     img = null; faceBox = null; faceLandmarks = null; faceTriangles = null; faceBase = null; avatarReady = false;
     hint.classList.remove('hidden'); $('#photoInfo').textContent = 'No photo selected';
@@ -463,9 +512,7 @@ function loadPhoto() {
   img = new Image(); img.onload = async () => {
     const valid = await validateHumanPhoto(img);
     drawAvatar();
-    if (valid) {
-      try { await startFaceControl(); } catch (e) { $('#faceControlStatus').textContent = `Camera control is waiting: ${e.message}`; }
-    }
+    if (valid) { $('#faceControlStatus').textContent = 'Photo avatar is ready. Click “Start face control” and allow camera access to control it with your face.'; }
   }; img.src = photos[selected].url;
 }
 
@@ -523,23 +570,62 @@ function drawDeformedFace() {
   if (!img || !faceBase || !faceTriangles?.length) return;
   const target = animatedFacePoints();
   if (!target) return;
+  const xs=faceBase.map(p=>p.x), ys=faceBase.map(p=>p.y);
+  const minX=Math.max(0, Math.floor(Math.min(...xs)-24)), minY=Math.max(0, Math.floor(Math.min(...ys)-24));
+  const maxX=Math.min(canvas.width, Math.ceil(Math.max(...xs)+24)), maxY=Math.min(canvas.height, Math.ceil(Math.max(...ys)+24));
+  const sw=Math.max(1,maxX-minX), sh=Math.max(1,maxY-minY);
   ctx.save();
-  // Draw the face mesh triangles over the original photo. The deformation is subtle
-  // enough to keep skin texture intact while moving eyes, brows, lips and jaw together.
   for (const tri of faceTriangles) {
-    const [ia, ib, ic] = tri;
-    const s0 = faceBase[ia], s1 = faceBase[ib], s2 = faceBase[ic];
-    const t0 = target[ia], t1 = target[ib], t2 = target[ic];
-    const m = affineForTriangle(s0, s1, s2, t0, t1, t2);
-    if (!m) continue;
+    const [ia,ib,ic]=tri, s0=faceBase[ia],s1=faceBase[ib],s2=faceBase[ic],t0=target[ia],t1=target[ib],t2=target[ic];
+    const m=affineForTriangle(s0,s1,s2,t0,t1,t2); if(!m) continue;
+    const triMinX=Math.max(minX,Math.floor(Math.min(t0.x,t1.x,t2.x)-2));
+    const triMinY=Math.max(minY,Math.floor(Math.min(t0.y,t1.y,t2.y)-2));
+    const triMaxX=Math.min(maxX,Math.ceil(Math.max(t0.x,t1.x,t2.x)+2));
+    const triMaxY=Math.min(maxY,Math.ceil(Math.max(t0.y,t1.y,t2.y)+2));
     ctx.save();
-    ctx.beginPath(); ctx.moveTo(t0.x, t0.y); ctx.lineTo(t1.x, t1.y); ctx.lineTo(t2.x, t2.y); ctx.closePath(); ctx.clip();
-    ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
-    const pad = 2;
-    ctx.drawImage(sourceCanvas, -pad, -pad, sourceCanvas.width + pad * 2, sourceCanvas.height + pad * 2, -pad, -pad, sourceCanvas.width + pad * 2, sourceCanvas.height + pad * 2);
+    ctx.beginPath();ctx.moveTo(t0.x,t0.y);ctx.lineTo(t1.x,t1.y);ctx.lineTo(t2.x,t2.y);ctx.closePath();ctx.clip();
+    ctx.setTransform(m.a,m.b,m.c,m.d,m.e,m.f);
+    ctx.drawImage(sourceCanvas,minX,minY,sw,sh,minX,minY,sw,sh);
     ctx.restore();
   }
   ctx.restore();
+  drawAnimatedMouth(target);
+  drawAnimatedEyes(target);
+}
+
+function facePoint(points,i){ return points[i] || {x:canvas.width/2,y:canvas.height/2}; }
+function polygon(points, ids){ ctx.beginPath(); ids.forEach((id,i)=>{const p=facePoint(points,id); if(i)ctx.lineTo(p.x,p.y);else ctx.moveTo(p.x,p.y);}); ctx.closePath(); }
+function drawAnimatedMouth(target){
+  if(!liveLandmarks || !liveNeutral) return;
+  const open=Math.max(0,Math.min(1,(mouthOpenSmooth-.015)/.12));
+  if(open<.035) return;
+  const upper=[61,185,40,39,37,0,267,269,270,409,291];
+  const lower=[291,375,321,314,17,84,181,91,61];
+  const mouth=upper.map(i=>facePoint(target,i));
+  const inner=[78,191,80,81,82,13,312,311,310,415,308,14,87,178,88].map(i=>facePoint(target,i));
+  const left=facePoint(target,61), right=facePoint(target,291), top=facePoint(target,13), bottom=facePoint(target,14);
+  const cx=(left.x+right.x)/2, cy=(top.y+bottom.y)/2;
+  const scale=Math.max(1,open*1.2);
+  ctx.save();
+  polygon(target, inner); ctx.fillStyle='rgba(25,7,10,.88)'; ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx,cy,Math.max(4,(right.x-left.x)*.32),Math.max(2,(bottom.y-top.y)*.62*scale),0,0,Math.PI*2);
+  ctx.fillStyle='rgba(18,5,8,.96)';ctx.fill();
+  if(open>.25){
+    ctx.beginPath();ctx.ellipse(cx,cy-(bottom.y-top.y)*.16,Math.max(5,(right.x-left.x)*.27),Math.max(2,(bottom.y-top.y)*.22),0,0,Math.PI*2);ctx.fillStyle='rgba(245,245,240,.9)';ctx.fill();
+  }
+  ctx.restore();
+}
+function drawAnimatedEyes(target){
+  if(!liveLandmarks) return;
+  const eyes=[{top:159,bottom:145,left:33,right:133,open:blinkSmoothL},{top:386,bottom:374,left:362,right:263,open:blinkSmoothR}];
+  for(const e of eyes){
+    const openness=Math.max(0,Math.min(1,(e.open-.018)/.09));
+    if(openness>.35) continue;
+    const a=facePoint(target,e.left),b=facePoint(target,e.right),t=facePoint(target,e.top),d=facePoint(target,e.bottom);
+    const cx=(a.x+b.x)/2,cy=(t.y+d.y)/2;
+    ctx.save();ctx.beginPath();ctx.ellipse(cx,cy,Math.max(5,Math.abs(b.x-a.x)*.38),Math.max(2,Math.abs(d.y-t.y)*.32),0,0,Math.PI*2);ctx.fillStyle='rgba(92,58,45,.5)';ctx.fill();ctx.restore();
+  }
 }
 
 function drawAvatar() {
@@ -549,14 +635,15 @@ function drawAvatar() {
   if (!avatarReady) { ctx.fillStyle = 'rgba(120,80,160,.25)'; ctx.fillRect(0,0,canvas.width,canvas.height); }
 }
 
-function animation() {
-  avatarTime = performance.now() / 1000;
+function animation(now = performance.now()) {
+  avatarTime = now / 1000;
   if (analyser) {
     const a = new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(a); let sum = 0;
     for (const v of a) { const n = (v - 128) / 128; sum += n * n; }
     const target = Math.min(1, Math.sqrt(sum / a.length) * 5); audioLevel += (target - audioLevel) * .25;
   } else audioLevel *= .9;
-  meterBar.style.width = `${Math.round(audioLevel * 100)}%`; talking.classList.toggle('hidden', !img || audioLevel < .035); drawAvatar();
+  meterBar.style.width = `${Math.round(audioLevel * 100)}%`; talking.classList.toggle('hidden', !img || audioLevel < .035);
+  if (now-lastRenderAt >= 1000/AVATAR_FPS) { drawAvatar(); lastRenderAt=now; }
   animationFrame = requestAnimationFrame(animation);
 }
 animation();
