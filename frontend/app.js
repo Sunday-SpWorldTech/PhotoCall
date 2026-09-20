@@ -1,3 +1,5 @@
+import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+
 const $ = (s) => document.querySelector(s);
 
 const candidates = [
@@ -49,13 +51,21 @@ async function fetchTimeout(url, options = {}, ms = 12000) {
 
 async function discoverBackend() {
   let last;
+  // Vercel serverless deployments commonly expose the Express handler under
+  // /api, so do not treat /health or / as the only valid probes.
+  const probes = ['/api/config', '/health', '/'];
   for (const base of [...new Set(candidates)]) {
-    for (const path of ['/health', '/']) {
+    for (const path of probes) {
       try {
-        const r = await fetchTimeout(`${base}${path}`);
-        if (r.ok) { API = base; return; }
+        const r = await fetchTimeout(`${base}${path}`, {}, 12000);
+        if (r.ok) {
+          API = base;
+          return;
+        }
         last = new Error(`${base}${path} returned ${r.status}`);
-      } catch (e) { last = e; }
+      } catch (e) {
+        last = e;
+      }
     }
   }
   throw new Error(`PhotoCall backend is unreachable. ${last?.message || 'Check the Vercel backend deployment and VITE_API_URL.'}`);
@@ -155,7 +165,7 @@ async function boot() {
     await startGuestSession();
     await loadConfig();
     status('Ready', true);
-    say('PhotoCall is ready. Upload a clear human photo to create your live avatar.');
+    say('PhotoCall backend is online. Upload a clear human photo and PhotoCall will build the facial avatar automatically.');
   } catch (e) {
     console.error(e);
     status('Backend offline');
@@ -179,25 +189,50 @@ function galleryRender() {
 
 async function loadFaceLandmarker() {
   if (window._photoCallFaceLandmarker) return window._photoCallFaceLandmarker;
-  if (!window._photoCallVisionPromise) {
-    window._photoCallVisionPromise = import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');
+  if (!FaceLandmarker || !FilesetResolver) throw new Error('MediaPipe FaceLandmarker is unavailable.');
+
+  // The JS engine is bundled by Vite from npm, so the previous failing
+  // `cdn.jsdelivr.net/.../+esm` dynamic import is no longer required.
+  const wasmUrls = [
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm',
+    'https://unpkg.com/@mediapipe/tasks-vision@1.0.1/wasm'
+  ];
+  let vision, lastError;
+  for (const wasmUrl of wasmUrls) {
+    try {
+      vision = await FilesetResolver.forVisionTasks(wasmUrl);
+      break;
+    } catch (e) {
+      lastError = e;
+      console.warn('PhotoCall MediaPipe WASM load failed:', wasmUrl, e);
+    }
   }
-  const { FaceLandmarker, FilesetResolver } = await window._photoCallVisionPromise;
-  const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
-  window._photoCallFaceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-      delegate: 'GPU'
-    },
-    runningMode: 'IMAGE',
-    numFaces: 1,
-    minFaceDetectionConfidence: 0.5,
-    minFacePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-    outputFaceBlendshapes: true,
-    outputFacialTransformationMatrixes: true
-  });
-  return window._photoCallFaceLandmarker;
+  if (!vision) throw new Error(`MediaPipe WASM failed to load. ${lastError?.message || ''}`);
+
+  const modelUrls = [
+    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/face_landmarker.task'
+  ];
+  let lastModelError;
+  for (const modelAssetPath of modelUrls) {
+    try {
+      window._photoCallFaceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath, delegate: 'GPU' },
+        runningMode: 'IMAGE',
+        numFaces: 1,
+        minFaceDetectionConfidence: 0.45,
+        minFacePresenceConfidence: 0.45,
+        minTrackingConfidence: 0.45,
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true
+      });
+      return window._photoCallFaceLandmarker;
+    } catch (e) {
+      lastModelError = e;
+      console.warn('PhotoCall FaceLandmarker model failed:', modelAssetPath, e);
+    }
+  }
+  throw new Error(`Face landmark model could not initialize. ${lastModelError?.message || ''}`);
 }
 
 function imageToCanvasPoint(lm, image = img) {
@@ -297,7 +332,7 @@ async function validateHumanPhoto(image) {
   } catch (e) {
     console.error('Face landmark engine:', e);
     avatarReady = false;
-    photoValidation.textContent = `Face animation could not initialize: ${e.message}`;
+    photoValidation.textContent = `Face animation engine error: ${e.message}`;
     return false;
   }
 }

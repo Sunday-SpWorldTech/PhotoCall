@@ -1,3 +1,10 @@
 {
-    "iis.configDir": ""
+    "iis.configDir": "",
+    "cSpell.words": [
+        "Blendshapes",
+        "Fileset",
+        "Landmarker",
+        "mediapipe",
+        "photocall"
+    ]
 }

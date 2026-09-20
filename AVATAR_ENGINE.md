@@ -1,25 +1,38 @@
 # PhotoCall Avatar Engine
 
-PhotoCall's browser avatar pipeline is now a real facial-landmark deformation pipeline:
+PhotoCall uses a real browser facial-landmark deformation pipeline:
 
 Photo
 → MediaPipe Face Landmarker
 → 400+ facial landmarks
 → reduced Delaunay facial mesh
-→ lips / jaw / eyes / eyebrows / head deformation
-→ Canvas generated frames
+→ eyes + eyebrows + lips + jaw + head deformation
+→ generated Canvas video frames
 → `canvas.captureStream(30)`
 → WebRTC video track
 
-## Important
+## What was fixed in this upgrade
 
-This is a 2D photo-puppet engine, not a generative neural video model. It uses the original pixels from the uploaded photo and warps them according to facial landmarks. This keeps the processing local in the browser and produces a real MediaStream that WebRTC can transmit.
+- The old `cdn.jsdelivr.net/.../+esm` dynamic import was removed.
+- `@mediapipe/tasks-vision@1.0.1` is now a declared frontend dependency so Vite bundles the JavaScript engine during the production build.
+- The WASM runtime and face-landmark model have CDN fallbacks.
+- The backend discovery check now tests `/api/config`, which works with the Vercel serverless backend instead of incorrectly requiring `/health` or `/`.
+- Backend Vercel routing now sends requests to the Node serverless entrypoint.
+- Existing `backend/.env`, `backend/.env.sample`, `frontend/.env`, and `frontend/.env.sample` are retained in the project package.
 
-The native Signal camera-source requirement is separate. The Android project can open Signal/share invites, but Android's normal third-party APIs do not let a regular app silently replace Signal's camera with an arbitrary virtual camera. A true Signal camera replacement requires an OS/device-level camera integration that Signal itself can select.
+## Result
+
+After a clear human photo is uploaded, PhotoCall detects the face, builds the landmark mesh, and continuously generates animated frames. When the microphone is active, speech level drives mouth/jaw movement; blinking and subtle head motion continue even when the microphone is not active.
+
+This is a **2D photo-puppet avatar engine**, not a generative neural-video model. It warps the original photo using facial landmarks, which makes the generated stream lightweight enough for browser/WebRTC use.
 
 ## Requirements
 
 - Modern Chrome/Edge with WebGL/WebAssembly support
-- HTTPS for microphone access in production
-- A clear, front-facing human face for best results
-- The MediaPipe model and WASM runtime are loaded from public CDNs at runtime
+- HTTPS in production
+- Clear, front-facing human photo with one visible face
+- Internet access to the MediaPipe WASM runtime and model on first initialization
+
+## Signal/native camera note
+
+The WebRTC avatar stream is real and can be sent to another PhotoCall WebRTC peer. A normal Android application cannot silently replace Signal's native camera with an arbitrary WebView/canvas stream through public Android APIs. A true Signal camera replacement requires a device/OS-level virtual-camera architecture that Signal can select.
