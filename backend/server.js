@@ -8,7 +8,7 @@ require('dotenv').config();
 const PORT = Number(process.env.PORT || 3000);
 const FRONTEND_URL = process.env.CLIENT_URL || 'https://photocall-frontend.vercel.app';
 const ALLOWED_ORIGINS = new Set([FRONTEND_URL, process.env.CORS_ORIGIN, 'https://photocall-frontend.vercel.app'].filter(Boolean).map(v => String(v).replace(/\/$/, '')));
-const VERCEL_FRONTEND_ORIGIN = /^https:\/\/(photo-call|photocall)-frontend(?:-[a-z0-9-]+)?\.vercel\.app$/i;
+const VERCEL_FRONTEND_ORIGIN = /^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i;
 const app = express();
 
 app.set('trust proxy', 1);

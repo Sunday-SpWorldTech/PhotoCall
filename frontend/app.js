@@ -1,12 +1,13 @@
 const $ = (s) => document.querySelector(s);
 
-const candidates = [
+const candidates = [...new Set([
+  '/api',
   import.meta.env.VITE_API_URL,
   import.meta.env.VITE_PRODUCTION_API_URL,
   'https://photocall-backend.vercel.app'
-].filter(Boolean).map(v => String(v).replace(/\/$/, ''));
+].filter(Boolean).map(v => String(v).replace(/\/$/, '')))];
 
-let API = candidates[0] || '';
+let API = candidates[0] || '/api';
 let guestId = localStorage.getItem('photocall_guest_id') || crypto.randomUUID();
 localStorage.setItem('photocall_guest_id', guestId);
 let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
@@ -72,10 +73,19 @@ async function discoverBackend() {
 }
 
 async function api(path, options = {}) {
-  const r = await fetchTimeout(API + path, options, 20000);
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.message || `Request failed (${r.status})`);
-  return d;
+  const ordered = [API, ...candidates.filter(v => v !== API)];
+  let lastError;
+  for (const base of ordered) {
+    try {
+      const r = await fetchTimeout(base + path, options, 20000);
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) { API = base; return d; }
+      lastError = new Error(d.message || `Request failed (${r.status})`);
+      if (r.status >= 500 || r.status === 404 || r.status === 502 || r.status === 503) continue;
+      throw lastError;
+    } catch (e) { lastError = e; }
+  }
+  throw new Error(lastError?.message || 'PhotoCall backend is unavailable.');
 }
 
 async function startGuestSession() {
@@ -130,7 +140,7 @@ async function pollEvents() {
 
 function startPolling() {
   clearInterval(pollTimer);
-  pollTimer = setInterval(pollEvents, 700);
+  pollTimer = setInterval(pollEvents, 450);
   pollEvents();
   status('Signaling online', true);
 }
@@ -181,7 +191,7 @@ async function boot() {
   } catch (e) {
     console.warn('Backend session/config unavailable:', e);
     status('Backend API online • database unavailable', true);
-    say('Avatar preview is ready. Backend session services are temporarily unavailable; calling/signaling will require the backend session to recover.');
+    say('Avatar preview is ready. Calling and voice services need the backend database/provider configuration.');
   }
 }
 
@@ -445,7 +455,7 @@ function updateExpressionState(lm, blendshapes = null) {
   const blendMouth = blend('jawOpen', 0);
   const blendBlinkL = blend('eyeBlinkLeft', 0);
   const blendBlinkR = blend('eyeBlinkRight', 0);
-  mouthOpenSmooth += ((Math.max(mouthH / mouthW, blendMouth * .55) - mouthOpenSmooth) * .32);
+  mouthOpenSmooth += ((Math.max(Math.min(mouthH / mouthW, .24), blendMouth * .72) - mouthOpenSmooth) * .24);
   blinkSmoothL += (Math.max(leftOpen, (1 - blendBlinkL) * .08) - blinkSmoothL) * .35;
   blinkSmoothR += (Math.max(rightOpen, (1 - blendBlinkR) * .08) - blinkSmoothR) * .35;
   const leftEye = lm[33], rightEye = lm[263], nose = lm[1];
@@ -471,22 +481,22 @@ function liveControlledFacePoints() {
   const scale = Math.min(1.16, Math.max(.86, neutralW / liveW));
   const lc = { x:(get(liveLandmarks,234).x+get(liveLandmarks,454).x)/2, y:(get(liveLandmarks,10).y+get(liveLandmarks,152).y)/2 };
   const nc = { x:(get(liveNeutral,234).x+get(liveNeutral,454).x)/2, y:(get(liveNeutral,10).y+get(liveNeutral,152).y)/2 };
-  const dxHead = (lc.x-nc.x) * baseW * 1.9;
-  const dyHead = (lc.y-nc.y) * baseH * 1.9;
+  const dxHead = (lc.x-nc.x) * baseW * 0.72;
+  const dyHead = (lc.y-nc.y) * baseH * 0.72;
 
   for (let i=0;i<p.length;i++) {
     const d=liveLandmarks[i], n=liveNeutral[i];
     if (!d || !n) continue;
     // Expression displacement: preserve the target photo proportions while transferring
     // the user's local expression changes onto the photo.
-    p[i].x += (d.x-n.x) * baseW * 2.15;
-    p[i].y += (d.y-n.y) * baseH * 2.15;
+    p[i].x += (d.x-n.x) * baseW * 1.15;
+    p[i].y += (d.y-n.y) * baseH * 1.15;
   }
 
   // Global head pose: translation + scale + rotation around the photo's face center.
-  const yaw = Math.max(-.22, Math.min(.22, headYawSmooth)) * 1.35;
-  const pitch = Math.max(-.18, Math.min(.18, headPitchSmooth-.32)) * 1.0;
-  const roll = Math.max(-.35, Math.min(.35, headRollSmooth)) * .65;
+  const yaw = Math.max(-.16, Math.min(.16, headYawSmooth)) * 0.62;
+  const pitch = Math.max(-.14, Math.min(.14, headPitchSmooth-.32)) * 0.55;
+  const roll = Math.max(-.28, Math.min(.28, headRollSmooth)) * 0.48;
   const cx = (baseLeft.x+baseRight.x)/2, cy = (baseTop.y+baseBottom.y)/2;
   const cos=Math.cos(roll), sin=Math.sin(roll);
   for (let i=0;i<p.length;i++) {
@@ -585,7 +595,10 @@ function drawDeformedFace() {
     ctx.save();
     ctx.beginPath();ctx.moveTo(t0.x,t0.y);ctx.lineTo(t1.x,t1.y);ctx.lineTo(t2.x,t2.y);ctx.closePath();ctx.clip();
     ctx.setTransform(m.a,m.b,m.c,m.d,m.e,m.f);
-    ctx.drawImage(sourceCanvas,minX,minY,sw,sh,minX,minY,sw,sh);
+    // sourceCanvas and faceBase share the same canvas coordinate system. Draw the
+    // complete source under the affine transform; cropping here breaks the
+    // source-to-target mapping and creates the large polygon seen in the preview.
+    ctx.drawImage(sourceCanvas, 0, 0);
     ctx.restore();
   }
   ctx.restore();
@@ -597,7 +610,7 @@ function facePoint(points,i){ return points[i] || {x:canvas.width/2,y:canvas.hei
 function polygon(points, ids){ ctx.beginPath(); ids.forEach((id,i)=>{const p=facePoint(points,id); if(i)ctx.lineTo(p.x,p.y);else ctx.moveTo(p.x,p.y);}); ctx.closePath(); }
 function drawAnimatedMouth(target){
   if(!liveLandmarks || !liveNeutral) return;
-  const open=Math.max(0,Math.min(1,(mouthOpenSmooth-.015)/.12));
+  const open=Math.max(0,Math.min(1,(mouthOpenSmooth-.025)/.16));
   if(open<.035) return;
   const upper=[61,185,40,39,37,0,267,269,270,409,291];
   const lower=[291,375,321,314,17,84,181,91,61];
@@ -609,10 +622,10 @@ function drawAnimatedMouth(target){
   ctx.save();
   polygon(target, inner); ctx.fillStyle='rgba(25,7,10,.88)'; ctx.fill();
   ctx.beginPath();
-  ctx.ellipse(cx,cy,Math.max(4,(right.x-left.x)*.32),Math.max(2,(bottom.y-top.y)*.62*scale),0,0,Math.PI*2);
+  ctx.ellipse(cx,cy,Math.max(3,(right.x-left.x)*.25),Math.max(2,(bottom.y-top.y)*.48*scale),0,0,Math.PI*2);
   ctx.fillStyle='rgba(18,5,8,.96)';ctx.fill();
   if(open>.25){
-    ctx.beginPath();ctx.ellipse(cx,cy-(bottom.y-top.y)*.16,Math.max(5,(right.x-left.x)*.27),Math.max(2,(bottom.y-top.y)*.22),0,0,Math.PI*2);ctx.fillStyle='rgba(245,245,240,.9)';ctx.fill();
+    ctx.beginPath();ctx.ellipse(cx,cy-(bottom.y-top.y)*.16,Math.max(4,(right.x-left.x)*.20),Math.max(2,(bottom.y-top.y)*.16),0,0,Math.PI*2);ctx.fillStyle='rgba(245,245,240,.9)';ctx.fill();
   }
   ctx.restore();
 }
@@ -671,6 +684,19 @@ async function setupAudio() {
   if (voiceEnabledEl.checked && uploadedVoiceReady) startVoiceClonePipeline();
 }
 
+async function fetchWithApiFallback(path, options = {}) {
+  const ordered = [API, ...candidates.filter(v => v !== API)];
+  let last;
+  for (const base of ordered) {
+    try {
+      const r = await fetchTimeout(base + path, options, 30000);
+      if (r.ok || (r.status >= 400 && r.status < 500 && r.status !== 404)) { API = base; return r; }
+      last = new Error(`Backend returned ${r.status}`);
+    } catch (e) { last = e; }
+  }
+  throw last || new Error('Backend is unavailable.');
+}
+
 async function startVoiceClonePipeline() {
   if (!micStream || voiceRecorder) return;
   const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
@@ -680,9 +706,9 @@ async function startVoiceClonePipeline() {
       if (!e.data.size) return;
       try {
         const form = new FormData(); form.append('file', e.data, 'speech.webm');
-        const r = await fetch(API + '/api/voice/convert', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || 'Voice conversion failed');
-        const buf = await audioCtx.decodeAudioData(await r.arrayBuffer());
+        const response = await fetchWithApiFallback('/api/voice/convert', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
+        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).message || `Voice conversion failed (${response.status})`);
+        const buf = await audioCtx.decodeAudioData(await response.arrayBuffer());
         const node = audioCtx.createBufferSource(); node.buffer = buf; node.connect(destination);
         const when = Math.max(audioCtx.currentTime + .02, voiceCloneQueueTime); node.start(when); voiceCloneQueueTime = when + buf.duration;
       } catch (err) { console.warn(err); }
@@ -704,9 +730,9 @@ voiceFileEl.onchange = async () => {
   voiceStatusEl.textContent = 'Uploading voice…';
   try {
     const form = new FormData(); form.append('file', f, f.name);
-    const r = await fetch(API + '/api/voice/clone', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
+    const r = await fetchWithApiFallback('/api/voice/clone', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.message || 'Voice cloning failed.');
+    if (!r.ok) throw new Error(d.message || `Voice cloning failed (${r.status}).`);
     uploadedVoiceReady = !!d.ready; voiceEnabledEl.checked = uploadedVoiceReady;
     voiceStatusEl.textContent = uploadedVoiceReady ? 'Uploaded voice is ready.' : 'Voice submitted; provider verification may be required.';
     if (uploadedVoiceReady && micStream) { stopVoiceClonePipeline(); startVoiceClonePipeline(); }
@@ -754,8 +780,8 @@ async function testVoice() {
   try {
     if (voiceEnabledEl.checked && uploadedVoiceReady) {
       const form = new FormData(); form.append('file', blob, 'voice-test.webm');
-      const r = await fetch(API + '/api/voice/convert', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || 'Voice conversion failed.');
+      const r = await fetchWithApiFallback('/api/voice/convert', { method: 'POST', headers: { 'X-Guest-Id': guestId }, body: form });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || `Voice conversion failed (${r.status}).`);
       const audio = new Audio(URL.createObjectURL(await r.blob()));
       await audio.play();
     } else {
